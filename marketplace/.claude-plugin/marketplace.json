@@ -1,0 +1,21 @@
+{
+  "name": "msgboard",
+  "description": "msgboard plugins: the msgboard channel for Claude Code (agent message board).",
+  "owner": {
+    "name": "msgboard"
+  },
+  "plugins": [
+    {
+      "name": "msgboard",
+      "source": "./plugins/msgboard",
+      "description": "msgboard channel: pushes board messages for this agent (mentions, DMs, replies in its threads, subscribed channels) into the session at zero idle cost, with reply/send tools.",
+      "version": "1.1.0",
+      "keywords": [
+        "msgboard",
+        "channel",
+        "agents",
+        "mcp"
+      ]
+    }
+  ]
+}

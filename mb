@@ -1,0 +1,2816 @@
+#!/usr/bin/env python3
+"""mb: message board CLI for humans and Claude Code agents.  Run `mb -h` for help."""
+import argparse
+import datetime
+import http.client
+import json
+import os
+import re
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+REPO_LAYOUT = os.path.exists(os.path.join(HERE, "server.py"))
+DATA_DIR = os.environ.get("MB_DATA_DIR") or (os.path.join(HERE, "data") if REPO_LAYOUT else os.path.expanduser("~/.msgboard"))
+
+
+def save_config(**fields):
+    """Merge fields into DATA_DIR/config.json (the fallback identity for shells without a Claude session id)."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    path = os.path.join(DATA_DIR, "config.json")
+    try:
+        with open(path) as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        cfg = {}
+    cfg.update({k: v for k, v in fields.items() if v is not None})
+    tmp = "%s.%d.tmp" % (path, os.getpid())
+    with open(tmp, "w") as f:
+        json.dump(cfg, f, indent=1)
+    os.replace(tmp, path)
+    return path
+
+
+def load_config():
+    """~/.msgboard/config.json (or $MB_DATA_DIR/config.json): url, token, user, project, remote, reconnect_secs."""
+    try:
+        with open(os.path.join(DATA_DIR, "config.json")) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+CONFIG = load_config()
+DEFAULT_URL = os.environ.get("MB_URL") or CONFIG.get("url") or "http://127.0.0.1:8765"
+IDENTITIES = os.path.join(DATA_DIR, "identities.json")
+SESSION_ID = os.environ.get("CLAUDE_CODE_SESSION_ID") or ""
+CODEX_THREAD = os.environ.get("CODEX_THREAD_ID") or ""  # Codex sets it for the shell commands of one thread
+SERVER_MAX_POLL = 30  # server caps one long-poll at 30s; the client loops
+RECONNECT_SECS = int(os.environ.get("MB_RECONNECT_SECS") or CONFIG.get("reconnect_secs") or 600)
+REMOTE = os.environ.get("MB_REMOTE") or CONFIG.get("remote") or ""  # set on remote machines: the name of this machine
+DEFAULT_PROJECT = "main"
+
+
+def die(msg, code=1):
+    print("mb: " + msg, file=sys.stderr, flush=True)
+    sys.exit(code)
+
+
+# ----------------------------------------------------------------- identity
+
+def load_identities():
+    try:
+        with open(IDENTITIES) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_identity(session, **fields):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    ids = load_identities()
+    cur = ids.get(session) or {}
+    cur.update({k: v for k, v in fields.items() if v is not None})
+    cur["ts"] = time.time()
+    cur["cwd"] = os.getcwd()
+    ids[session] = cur
+    tmp = "%s.%d.tmp" % (IDENTITIES, os.getpid())
+    with open(tmp, "w") as f:
+        json.dump(ids, f, indent=1)
+    os.replace(tmp, IDENTITIES)
+
+
+def session_identity():
+    """The identity bound to this Claude Code session or Codex thread (by `mb join`, `mb claude`, `mb codex`)."""
+    if not (SESSION_ID or CODEX_THREAD):
+        return {}
+    ids = load_identities()
+    return (ids.get(CODEX_THREAD) if CODEX_THREAD else None) or (ids.get(SESSION_ID) if SESSION_ID else None) or {}
+
+
+_under_daemon = None
+
+
+def under_codex_daemon():
+    """True when this process descends from Codex's shared app-server daemon (interactive Codex runs its shell
+    commands there), whose environment belongs to whoever started it, not to this thread."""
+    global _under_daemon
+    if _under_daemon is not None:
+        return _under_daemon
+    _under_daemon = False
+    try:
+        out = subprocess.run(["ps", "-axo", "pid=,ppid=,command="], capture_output=True, text=True, timeout=5).stdout
+        tree = {}
+        for line in out.splitlines():
+            parts = line.split(None, 2)
+            if len(parts) >= 2:
+                tree[int(parts[0])] = (int(parts[1]), parts[2] if len(parts) > 2 else "")
+        pid = os.getppid()
+        for _ in range(15):
+            ppid, cmd = tree.get(pid, (0, ""))
+            if "app-server" in cmd and "codex" in cmd:
+                _under_daemon = True
+                break
+            if ppid <= 1:
+                break
+            pid = ppid
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        pass
+    return _under_daemon
+
+
+def env_identity(var):
+    """MB_USER / MB_PROJECT from the environment. Not inside an unbound Codex thread that runs under the shared
+    daemon: there the variables are the daemon's (inherited from whichever session started it)."""
+    val = os.environ.get(var)
+    if val and CODEX_THREAD and under_codex_daemon():
+        return None
+    return val
+
+
+def config_identity_allowed():
+    """The config-file identity (written by `mb join` in a plain terminal) is for humans typing at a terminal.
+    Agents and scripts run without a TTY and must identify themselves (session binding, --as, MB_USER), so a stale
+    default can never attribute their posts to someone else."""
+    return os.environ.get("MB_USE_CONFIG_IDENTITY") == "1" or (sys.stdin.isatty() and sys.stdout.isatty())
+
+
+def resolve_user(args, required=True):
+    bound = session_identity()
+    name = (getattr(args, "as_", None) or (bound.get("name") if CODEX_THREAD else None)  # a bound Codex thread beats the daemon's env
+            or env_identity("MB_USER") or bound.get("name")
+            or (CONFIG.get("user") if config_identity_allowed() else None))
+    if not name and required:
+        die("no identity yet. Run `mb join <name> -p <project>` (or just `mb join` for an auto name) first; "
+            "or pass --as <name> / set MB_USER.")
+    return name
+
+
+def resolve_project(args):
+    bound = session_identity()
+    return (getattr(args, "project", None) or (bound.get("project") if CODEX_THREAD else None)
+            or env_identity("MB_PROJECT") or bound.get("project")
+            or (CONFIG.get("project") if config_identity_allowed() else None) or None)
+
+
+# ----------------------------------------------------------------- http
+
+class Unreachable(Exception):
+    pass
+
+
+class UnixHTTPConnection(http.client.HTTPConnection):
+    """HTTP over a Unix socket (the reverse tunnel on a remote machine ends in one)."""
+
+    def __init__(self, path, timeout=None):
+        super().__init__("localhost", timeout=timeout)
+        self.unix_path = path
+
+    def connect(self):
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(self.timeout)
+        sock.connect(self.unix_path)
+        self.sock = sock
+
+
+def base_url(args):
+    url = getattr(args, "url", None) or DEFAULT_URL
+    return url if url.startswith("unix://") else url.rstrip("/")
+
+
+def connection(base, timeout):
+    if base.startswith("unix://"):
+        return UnixHTTPConnection(base[len("unix://"):], timeout=timeout)
+    u = urllib.parse.urlsplit(base)
+    if u.scheme == "https":
+        return http.client.HTTPSConnection(u.hostname, u.port or 443, timeout=timeout)
+    return http.client.HTTPConnection(u.hostname or "127.0.0.1", u.port or 80, timeout=timeout)
+
+
+def unreachable_msg(base, reason):
+    if REMOTE:
+        return ("board not reachable via %s (%s). The tunnel from the board host to this machine (%s) is down; "
+                "wait a minute and retry. `mb wait`/`mb follow` keep retrying by themselves for %d min."
+                % (base, reason, REMOTE, RECONNECT_SECS // 60))
+    return "server not reachable at %s (%s). Start it with: mb serve -d" % (base, reason)
+
+
+def api(args, method, path, params=None, body=None, timeout=20, die_on_unreachable=True):
+    base = base_url(args)
+    if params:
+        params = {k: v for k, v in params.items() if v is not None}
+        path += "?" + urllib.parse.urlencode(params)
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    headers = {"Content-Type": "application/json", "Host": "localhost"}
+    token = getattr(args, "token", None) or os.environ.get("MB_TOKEN") or CONFIG.get("token")
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    try:
+        conn = connection(base, timeout)
+        conn.request(method, path, body=data, headers=headers)
+        resp = conn.getresponse()
+        raw = resp.read()
+        conn.close()
+    except (OSError, http.client.HTTPException) as e:
+        if not die_on_unreachable:
+            raise Unreachable(str(e) or e.__class__.__name__)
+        die(unreachable_msg(base, str(e) or e.__class__.__name__))
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except ValueError:
+        payload = {"error": "non-JSON response (%d): %s" % (resp.status, raw[:200].decode("utf-8", "replace"))}
+    if resp.status >= 400:
+        die("%s" % (payload.get("error") if isinstance(payload, dict) else payload))
+    return payload
+
+
+def health(args):
+    try:
+        return api(args, "GET", "/api/health", timeout=3, die_on_unreachable=False)
+    except Unreachable:
+        return None
+    except SystemExit:
+        return None
+
+
+# ----------------------------------------------------------------- output
+
+def fmt_ts(ts):
+    return datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M") if ts else "-"
+
+
+def rel(ts):
+    if not ts:
+        return "never"
+    s = max(0, time.time() - ts)
+    if s < 60:
+        return "just now"
+    if s < 3600:
+        return "%dm ago" % (s // 60)
+    if s < 86400:
+        return "%dh ago" % (s // 3600)
+    return "%dd ago" % (s // 86400)
+
+
+def fmt_dur(secs):
+    secs = int(max(0, secs))
+    if secs < 60:
+        return "%ds" % secs
+    if secs < 3600:
+        return "%dm" % (secs // 60)
+    if secs < 86400:
+        return "%dh%02dm" % (secs // 3600, (secs % 3600) // 60)
+    return "%dd%02dh" % (secs // 86400, (secs % 86400) // 3600)
+
+
+def flags(m):
+    f = []
+    if m.get("reply_to"):
+        f.append("↳#%d" % m["reply_to"])
+    kind = m.get("kind") or "message"
+    if kind == "ask":
+        f.append("✓" if m.get("resolved_ts") else "?")
+    elif kind in ("answer", "system", "paste"):
+        f.append(kind if kind != "system" else "sys")
+    if m.get("pinned_ts"):
+        f.append("📌")
+    return (" " + " ".join(f)) if f else ""
+
+
+def fmt_msg(m, show_channel=True):
+    head = "[#%d%s] %s %s<%s>" % (m["id"], flags(m), fmt_ts(m["ts"]),
+                                   (m["channel"] + " ") if show_channel else "", m["user"])
+    if m.get("reply_count"):
+        head += " (%d repl%s)" % (m["reply_count"], "ies" if m["reply_count"] != 1 else "y")
+    text = m["text"]
+    if "\n" in text:
+        return head + "\n" + "\n".join("    " + line for line in text.split("\n"))
+    return head + " " + text
+
+
+def emit(msgs, args, show_channel=True):
+    for m in msgs:
+        if getattr(args, "json", False):
+            print(json.dumps(m, ensure_ascii=False), flush=True)
+        else:
+            print(fmt_msg(m, show_channel), flush=True)
+
+
+def read_text(args, attr="text"):
+    if getattr(args, "file", None):
+        with open(args.file) as f:
+            return f.read()
+    words = getattr(args, attr, None) or []
+    if words == ["-"] or (not words and not sys.stdin.isatty()):
+        return sys.stdin.read()
+    text = " ".join(words)
+    if not text.strip():
+        die("empty message. Pass text as arguments, `-` to read stdin, or --file PATH.")
+    return text
+
+
+def resolve_channel(args, ref, must_exist=False):
+    """'@user' -> DM key; 'name' or 'project/name' -> channel key."""
+    if ref.startswith("@"):
+        me = resolve_user(args)
+        ch = api(args, "GET", "/api/dm", {"as": me, "with": ref[1:]})
+        return ch["key"]
+    res = api(args, "GET", "/api/resolve", {"channel": ref, "project": resolve_project(args)})
+    if must_exist and not res["exists"]:
+        hint = (" Did you mean %s?" % ", ".join(res["candidates"])) if res.get("candidates") else ""
+        die("no such channel %r.%s `mb channels` lists them; `mb send %s ...` or `mb create %s` creates it."
+            % (res["key"], hint, ref, ref))
+    return res["key"]
+
+
+# ----------------------------------------------------------------- server commands
+
+def cmd_serve(args):
+    u = urllib.parse.urlsplit(base_url(args))
+    host = args.host or u.hostname or "127.0.0.1"
+    port = args.port or u.port or 8765
+    cmd = [sys.executable, os.path.join(HERE, "server.py"), "--host", host, "--port", str(port),
+           "--data-dir", DATA_DIR]
+    if not args.daemon:
+        os.execv(sys.executable, cmd)
+    h = health(args)
+    if h:
+        print("already running at %s (pid %s)" % (h["url"], h.get("pid")))
+        return 0
+    os.makedirs(DATA_DIR, exist_ok=True)
+    logpath = os.path.join(DATA_DIR, "server.log")
+    with open(logpath, "ab") as log:
+        p = subprocess.Popen(cmd, stdout=log, stderr=log, stdin=subprocess.DEVNULL,
+                             start_new_session=True, cwd=HERE)
+    for _ in range(50):
+        time.sleep(0.1)
+        if p.poll() is not None:
+            die("server exited with code %s; see %s" % (p.returncode, logpath))
+        h = health(args)
+        if h:
+            print("msgboard running at %s (pid %d)\nGUI: %s\nlog: %s" % (h["url"], p.pid, h["url"], logpath))
+            return 0
+    die("server did not become healthy within 5s; see %s" % logpath)
+
+
+def cmd_stop(args):
+    h = health(args)
+    pid = h.get("pid") if h else None
+    if not pid:
+        try:
+            with open(os.path.join(DATA_DIR, "server.pid")) as f:
+                pid = int(f.read().strip())
+        except (OSError, ValueError):
+            print("not running")
+            return 0
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        print("not running (stale pid %d)" % pid)
+        return 0
+    for _ in range(50):
+        time.sleep(0.1)
+        if not health(args):
+            print("stopped (pid %d)" % pid)
+            return 0
+    die("server (pid %d) still answering after 5s" % pid)
+
+
+def cmd_status(args):
+    me = resolve_user(args, required=False)
+    if args.text or args.clear:
+        if not me:
+            die("no identity (mb join <name>)")
+        status = "" if args.clear else " ".join(args.text)
+        u = api(args, "POST", "/api/users", body={"name": me, "status": status})
+        print("%s %s status: %s" % (u["emoji"], me, u["status"] or "(cleared)"))
+        return 0
+    h = health(args)
+    if not h:
+        if REMOTE:
+            print("board: NOT REACHABLE via %s. The tunnel from the board host to this machine (%s) is down; wait a minute and retry."
+                  % (base_url(args), REMOTE))
+        else:
+            print("server: DOWN at %s  (start: mb serve -d)" % base_url(args))
+        return 1
+    print("server:   %s  pid %s  up %s%s" % (h["url"], h.get("pid"), rel(time.time() - h["uptime"]).replace(" ago", ""),
+                                             "  (token auth)" if h.get("auth") else ""))
+    print("counts:   %d users, %d projects, %d channels, %d messages, %d open tasks"
+          % (h["users"], h["projects"], h["channels"], h["messages"], h["tasks_open"]))
+    try:
+        links = api(args, "GET", "/api/links", die_on_unreachable=False)
+    except (Unreachable, SystemExit):
+        links = []
+    for L in links:
+        age = fmt_dur(time.time() - (L.get("since") or time.time()))
+        print("link:     %-24s %-10s for %s%s" % (L["host"], L["state"], age,
+                                                  ("  last error: " + L["last_error"][:80]) if L.get("last_error") and L["state"] != "up" else ""))
+    if REMOTE:
+        print("remote:   this machine is %s; the board is reached through the tunnel socket" % REMOTE)
+    if me:
+        u = next((x for x in api(args, "GET", "/api/users") if x["name"] == me), None)
+        proj = resolve_project(args) or "(none: mb project use <name>)"
+        print("identity: %s %s  project: %s  status: %s" % (u["emoji"] if u else "", me, proj,
+                                                              (u or {}).get("status") or "(none: mb status \"...\")"))
+    else:
+        print("identity: (none: run `mb join <name>`)")
+    return 0
+
+
+def cmd_url(args):
+    print(base_url(args))
+    return 0
+
+
+def cmd_open(args):
+    subprocess.run(["open", base_url(args)], check=False)
+    return 0
+
+
+# ----------------------------------------------------------------- identity commands
+
+def auto_name():
+    """<cwd folder>-<4 chars of session id>, e.g. rl_env-3f9a. Falls back to agent-<random>."""
+    import random
+    folder = re.sub(r"[^A-Za-z0-9_.-]", "", os.path.basename(os.getcwd()))[:20].strip(".-") or "agent"
+    if os.getcwd() == os.path.expanduser("~"):
+        folder = "agent"
+    suffix = SESSION_ID.replace("-", "")[-4:] if SESSION_ID else "%04x" % random.randrange(16 ** 4)
+    return "%s-%s" % (folder, suffix)
+
+
+def cmd_join(args):
+    name = args.name or auto_name()
+    project = args.project or os.environ.get("MB_PROJECT") or None
+    body = {"name": name, "cwd": os.getcwd()}
+    if args.emoji:
+        body["emoji"] = args.emoji
+    if args.status:
+        body["status"] = args.status
+    if project:
+        body["project"] = project
+    if args.human:
+        body["human"] = True
+    res = api(args, "POST", "/api/users", body=body)
+    if project:
+        p = api(args, "POST", "/api/projects", body={"name": project, "user": name})
+        if p.get("created"):
+            print("created project %s (channels: %s/general)" % (project, project))
+    if res.get("created"):
+        print("joined as %s %s" % (res["emoji"], name))
+    else:
+        print("welcome back, %s %s (existing user, last seen %s; pick another name if that's not you)"
+              % (res["emoji"], name, rel(res["last_seen"])))
+    if CODEX_THREAD:
+        save_identity(CODEX_THREAD, name=name, project=project)
+        print("bound to this Codex thread: no --as needed from now on" + (" (default project: %s)" % project if project else ""))
+    elif SESSION_ID:
+        save_identity(SESSION_ID, name=name, project=project)
+        print("bound to this Claude Code session: no --as needed from now on"
+              + (" (default project: %s)" % project if project else ""))
+    else:
+        path = save_config(user=name, project=project)
+        print("no Claude session id in this shell: saved as the default identity for interactive terminals (%s). "
+              "Scripts and agents without a session id must pass --as %s%s (or set MB_USER/MB_PROJECT)."
+              % (path, name, (" -p " + project) if project else ""))
+    if not args.emoji:
+        print("your emoji is %s (change it: mb emoji <emoji>)" % res["emoji"])
+    if not args.status:
+        print("set what you're working on: mb status \"...\"")
+    rows = api(args, "GET", "/api/unread", {"as": name})
+    rows = [r for r in rows if not project or r["project"] in (project, DEFAULT_PROJECT)]
+    print("channels: " + ", ".join("%s (%d unread)" % (r["channel"], r["unread"]) for r in rows[:12]))
+    print("next: mb read <channel> | mb send <channel> <text> | mb wait <channel> | mb inbox | mb tasks")
+    return 0
+
+
+def cmd_whoami(args):
+    me = resolve_user(args, required=False)
+    if not me:
+        die("no identity (run `mb join <name>`)", 1)
+    print(me + ("  project: " + resolve_project(args) if resolve_project(args) else ""))
+    return 0
+
+
+def cmd_emoji(args):
+    me = resolve_user(args)
+    u = api(args, "POST", "/api/users", body={"name": me, "emoji": args.emoji})
+    print("%s is now %s" % (me, u["emoji"]))
+    return 0
+
+
+def cmd_users(args):
+    rows = api(args, "GET", "/api/users", {"project": args.project})
+    if not rows:
+        print("no users yet")
+    for u in rows:
+        online = (time.time() - u["last_seen"]) < 120
+        print("%s%s %-22s %-10s %-10s %-9s %4d msgs  %-28s %s%s"
+              % ("●" if u.get("live") else " ", u["emoji"] or " ", u["name"], (u["project"] or "-")[:10],
+                 "live" if u.get("live") else ("active" if online else rel(u["last_seen"])),
+                 "human" if u["human"] else "agent", u["messages"] or 0, ",".join(u.get("areas") or [])[:28],
+                 ("working on: " + u["status"]) if u["status"] else "", ("  [%d tasks]" % u["tasks_taken"]) if u["tasks_taken"] else ""))
+    return 0
+
+
+# ----------------------------------------------------------------- projects / channels
+
+def cmd_projects(args):
+    rows = api(args, "GET", "/api/projects")
+    cur = resolve_project(args)
+    for p in rows:
+        print("%s %-16s %-20s %2d channels  %2d open tasks  %4d msgs  last %-10s  %s"
+              % ("*" if p["name"] == cur else " ", p["name"], p["title"][:20], p["channels"], p["open_tasks"],
+                 p["messages"], rel(p["last_ts"]), p["description"]))
+    if cur:
+        print("(* = your default project)")
+    return 0
+
+
+def cmd_project(args):
+    sub = args.action
+    if sub is None:
+        cur = resolve_project(args)
+        print(cur or "(no default project; set one with: mb project use <name>)")
+        return 0
+    if sub == "use":
+        if not args.name:
+            die("usage: mb project use <name>")
+        api(args, "POST", "/api/projects", body={"name": args.name, "user": resolve_user(args, required=False) or ""})
+        if SESSION_ID:
+            save_identity(SESSION_ID, project=args.name)
+            me = resolve_user(args, required=False)
+            if me:
+                api(args, "POST", "/api/users", body={"name": me, "project": args.name})
+            print("default project for this session: %s" % args.name)
+        else:
+            path = save_config(project=args.name)
+            print("default project for shells without a Claude session id: %s (saved in %s)" % (args.name, path))
+        return 0
+    if sub == "create":
+        if not args.name:
+            die("usage: mb project create <name> [--title T] [--desc D]")
+        p = api(args, "POST", "/api/projects", body={"name": args.name, "title": args.title or "",
+                                                     "description": args.desc or "",
+                                                     "user": resolve_user(args, required=False) or ""})
+        print(("created project %s" if p.get("created") else "project %s updated") % p["name"]
+              + " (home channel: %s/general)" % p["name"])
+        return 0
+    if sub == "show":
+        name = args.name or resolve_project(args)
+        if not name:
+            die("usage: mb project show <name>")
+        o = api(args, "GET", "/api/projects/%s" % name, {"as": resolve_user(args, required=False)})
+        p = o["project"]
+        print("%s: %s" % (p["name"], p["title"]) + ("\n  %s" % p["description"] if p["description"] else ""))
+        print("channels:")
+        for c in o["channels"]:
+            print("  %-28s %4d msgs  %s%s" % (c["key"], c["messages"], ("%d unread  " % c["unread"]) if c.get("unread") else "", c["topic"]))
+        tasks = [t for t in o["tasks"] if t["status"] != "done"]
+        print("tasks (%d open/taken, %d done):" % (len(tasks), len(o["tasks"]) - len(tasks)))
+        for t in tasks:
+            print("  #%-4d [%-5s %-12s] %s" % (t["id"], t["status"], t["owner"] or "-", t["title"]))
+        if o["asks"]:
+            print("open questions:")
+            for a in o["asks"]:
+                print("  [#%d] %s <%s> %s" % (a["id"], a["channel"], a["user"], a["text"].split("\n")[0][:100]))
+        print("people:")
+        for u in o["people"]:
+            print("  %s %-20s %-12s %s" % (u["emoji"], u["name"], rel(u["last_seen"]), u["status"] or ""))
+        if o["pins"]:
+            print("pinned: %d (mb pins -p %s)" % (len(o["pins"]), name))
+        return 0
+    die("unknown project action %r (use | create | show)" % sub)
+
+
+def cmd_channels(args):
+    rows = api(args, "GET", "/api/channels", {"project": args.project, "as": resolve_user(args, required=False)})
+    cur = None
+    for c in rows:
+        if c["kind"] == "dm":
+            continue
+        if c["project"] != cur:
+            cur = c["project"]
+            print("project %s:" % cur)
+        print("  %-28s %5d msgs  %-10s last %-10s  %s"
+              % (c["key"], c["messages"], ("%d unread" % c["unread"]) if c.get("unread") else "", rel(c["last_ts"]), c["topic"]))
+    dms = [c for c in rows if c["kind"] == "dm"]
+    if dms:
+        print("direct messages:")
+        for c in dms:
+            print("  %-28s %5d msgs  last %s" % (c["key"], c["messages"], rel(c["last_ts"])))
+    return 0
+
+
+def cmd_create(args):
+    me = resolve_user(args, required=False)
+    key = args.channel if "/" in args.channel else "%s/%s" % (resolve_project(args) or DEFAULT_PROJECT, args.channel)
+    res = api(args, "POST", "/api/channels", body={"key": key, "topic": args.topic or "", "user": me or ""})
+    print(("created %s" if res.get("created") else "%s already exists") % res["key"])
+    return 0
+
+
+def cmd_topic(args):
+    me = resolve_user(args, required=False)
+    key = resolve_channel(args, args.channel, must_exist=True)
+    res = api(args, "POST", "/api/channels", body={"key": key, "topic": " ".join(args.text), "user": me or ""})
+    print("%s topic: %s" % (res["key"], res["topic"]))
+    return 0
+
+
+# ----------------------------------------------------------------- messages
+
+def cmd_read(args):
+    me = resolve_user(args, required=False)
+    key = resolve_channel(args, args.channel, must_exist=True)
+    params = {"as": me, "peek": "1" if args.peek else None, "threads": "1" if args.threads else None}
+    limit = 5000 if args.all else args.limit
+    since, before = args.since, args.before
+    if args.unread:
+        if not me:
+            die("--unread needs an identity (mb join <name> or --as)")
+        row = next((r for r in api(args, "GET", "/api/unread", {"as": me}) if r["channel"] == key), None)
+        if row and row["last_id"]:
+            since, limit = row["last_id"], 5000
+    params.update(limit=limit, since=since, before=before)
+    msgs = api(args, "GET", "/api/channels/%s/messages" % urllib.parse.quote(key, safe=""), params)
+    if not msgs and not getattr(args, "json", False):
+        print("(no messages)")
+    emit(msgs, args, show_channel=False)
+    return 0
+
+
+def cmd_send(args):
+    me = resolve_user(args)
+    key = resolve_channel(args, args.channel)
+    text = read_text(args)
+    m = api(args, "POST", "/api/channels/%s/messages" % urllib.parse.quote(key, safe=""),
+            body={"user": me, "text": text, "cwd": os.getcwd()})
+    print("sent [#%d] to %s as %s" % (m["id"], m["channel"], m["user"]))
+    return 0
+
+
+def cmd_reply(args, kind="message"):
+    me = resolve_user(args)
+    text = read_text(args)
+    m = api(args, "POST", "/api/messages/%d/reply" % args.id, body={"user": me, "text": text, "kind": kind})
+    if kind == "answer":
+        print("answered #%d with [#%d] in %s (question marked answered)" % (m["reply_to"], m["id"], m["channel"]))
+    else:
+        print("replied [#%d] in thread #%d (%s)" % (m["id"], m["reply_to"], m["channel"]))
+    return 0
+
+
+def cmd_answer(args):
+    return cmd_reply(args, kind="answer")
+
+
+def cmd_thread(args):
+    me = resolve_user(args, required=False)
+    t = api(args, "GET", "/api/messages/%d/thread" % args.id, {"as": me})
+    if getattr(args, "json", False):
+        print(json.dumps(t, ensure_ascii=False))
+        return 0
+    print(fmt_msg(t["root"], show_channel=True))
+    for r in t["replies"]:
+        print("  " + fmt_msg(r, show_channel=False).replace("\n", "\n  "))
+    if not t["replies"]:
+        print("  (no replies yet; reply with: mb reply %d \"...\")" % t["root"]["id"])
+    return 0
+
+
+def cmd_dm(args):
+    me = resolve_user(args)
+    key = resolve_channel(args, "@" + args.user)
+    text = read_text(args)
+    m = api(args, "POST", "/api/channels/%s/messages" % urllib.parse.quote(key, safe=""),
+            body={"user": me, "text": text})
+    print("sent [#%d] to %s" % (m["id"], m["channel"]))
+    return 0
+
+
+def cmd_ask(args):
+    me = resolve_user(args)
+    targets = [w[1:] for w in args.words if w.startswith("@")]
+    words = [w for w in args.words if not w.startswith("@")]
+    args.text = words
+    text = read_text(args)
+    group_names = {g["name"] for g in api(args, "GET", "/api/groups", {"project": resolve_project(args)})} if targets else set()
+    if args.channel:
+        key = resolve_channel(args, args.channel)
+    elif len(targets) == 1 and targets[0].lower() not in ("all", "here", "everyone") and targets[0] not in group_names:
+        key = resolve_channel(args, "@" + targets[0])
+    else:
+        key = "%s/general" % (resolve_project(args) or DEFAULT_PROJECT)
+    missing = [t for t in targets if not re.search(r"(?<![\w.-])@%s(?![\w.-])" % re.escape(t), text)]
+    if missing:
+        text = " ".join("@" + t for t in missing) + " " + text
+    m = api(args, "POST", "/api/channels/%s/messages" % urllib.parse.quote(key, safe=""),
+            body={"user": me, "text": text, "kind": "ask", "meta": {"to": targets}})
+    print("asked [#%d] in %s%s" % (m["id"], m["channel"], (" (to %s)" % ", ".join("@" + t for t in targets)) if targets else ""))
+    print("wait for the answer: mb wait --reply-to %d   |   see replies: mb thread %d" % (m["id"], m["id"]))
+    return 0
+
+
+def cmd_asks(args):
+    me = resolve_user(args, required=False)
+    rows = api(args, "GET", "/api/asks", {"as": None if args.everyone else me, "project": args.project,
+                                           "all": "1" if args.all else None})
+    if not rows:
+        print("no open questions" + (" for/by you" if me and not args.everyone else ""))
+    for a in rows:
+        who = "you asked" if a["user"] == me else "from " + a["user"]
+        print("[#%d %s] %s %s  %s%s" % (a["id"], "✓" if a["resolved_ts"] else "?", a["channel"], who,
+                                        a["text"].split("\n")[0][:110],
+                                        (" (%d repl%s)" % (a["reply_count"], "ies" if a["reply_count"] != 1 else "y")) if a.get("reply_count") else ""))
+    return 0
+
+
+def cmd_unread(args):
+    me = resolve_user(args)
+    rows = api(args, "GET", "/api/unread", {"as": me})
+    total = 0
+    for r in rows:
+        total += r["unread"]
+        if r["unread"] or args.all:
+            print("%-28s %5d unread   (read up to #%d, latest #%d)" % (r["channel"], r["unread"], r["last_id"], r["latest_id"]))
+    print("total: %d unread" % total)
+    return 0
+
+
+def cmd_inbox(args):
+    me = resolve_user(args)
+    ib = api(args, "GET", "/api/inbox", {"as": me})
+    if getattr(args, "json", False):
+        print(json.dumps(ib, ensure_ascii=False))
+        return 0
+    if args.brief:
+        if ib["summary"]:
+            print("msgboard (%s): %s" % (me, ib["summary"]))
+        return 0
+    print("inbox for %s: %s" % (me, ib["summary"] or "nothing new"))
+    sections = (("mentions of you", ib["mentions"]), ("replies in your threads", ib["thread_replies"]),
+                ("direct messages", ib["dms"]), ("open questions for you", ib["asks_to_me"]),
+                ("your open questions", ib["my_open_asks"]))
+    for title, rows in sections:
+        if rows:
+            print("-- %s" % title)
+            emit(rows, args, show_channel=True)
+    if ib.get("my_prs"):
+        print("-- your open PRs")
+        for pr in ib["my_prs"]:
+            print("  " + fmt_pr(pr, show_url=False))
+    if ib["my_tasks"]:
+        print("-- tasks you hold")
+        for t in ib["my_tasks"]:
+            print("  #%d [%s] %s (%s)" % (t["id"], t["status"], t["title"], t["project"]))
+    if ib["unread"]:
+        print("-- unread by channel")
+        for u in ib["unread"]:
+            print("  %-28s %d" % (u["channel"], u["unread"]))
+    return 0
+
+
+def cmd_wait(args, follow=False):
+    if getattr(args, "feed", False):
+        return feed_loop(args, follow)
+    me = resolve_user(args)
+    mention = bool(args.mention)
+    thread = getattr(args, "reply_to", None)
+    peek = mention or bool(getattr(args, "peek", False)) or thread is not None
+    channel = resolve_channel(args, args.channel, must_exist=True) if args.channel else None
+    project = None if channel else (args.project or None)  # no channel + no -p = every channel; -p narrows
+    since = args.since
+    default_since = None
+    if thread is not None and since is None:
+        since = thread  # every reply after the root, so an answer that already landed is returned at once
+    elif peek and since is None:
+        h = health(args)
+        if not h:
+            die("server not reachable at %s. Start it with: mb serve -d" % base_url(args))
+        since = h["latest_id"]
+    deadline = time.monotonic() + args.timeout if getattr(args, "timeout", None) else None
+    outage_started = None
+    printed = {}      # channel -> highest id printed (re-deliveries after a lost response are not printed twice)
+    unacked = {}      # channel -> highest id delivered but not yet acknowledged to the server
+
+    def ack():
+        for ch in list(unacked):
+            try:
+                api(args, "POST", "/api/channels/%s/read" % urllib.parse.quote(ch, safe=""),
+                    body={"user": me, "last_id": unacked[ch]}, timeout=10, die_on_unreachable=False)
+                del unacked[ch]
+            except (Unreachable, SystemExit):
+                pass  # retried after the next successful poll; until then the server re-delivers (at least once)
+    if not args.quiet:
+        what = ("replies to #%d" % thread) if thread is not None else ("mentions of @%s" % me if mention else "messages")
+        where = channel or ("project %s" % project if project else "any channel")
+        print("%s %s in %s as %s%s%s" % ("following" if follow else "waiting for", what, where, me,
+                                         " (since #%d)" % since if since is not None else "",
+                                         " (peek: read cursor untouched)" if peek and not mention and thread is None else ""),
+              file=sys.stderr, flush=True)
+    while True:
+        poll = SERVER_MAX_POLL
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                if not args.quiet:
+                    print("timeout: no new messages", file=sys.stderr, flush=True)
+                return 124
+            poll = max(1, min(poll, int(remaining + 0.999)))
+        params = {"as": me, "channel": channel, "project": project, "mention": me if mention else None,
+                  "thread": thread, "since": since, "default_since": default_since, "timeout": poll,
+                  "limit": 500, "peek": "1" if peek else None, "ack": None if peek else "client",
+                  "no_threads": "1" if getattr(args, "no_threads", False) else None}
+        try:
+            res = api(args, "GET", "/api/wait", params, timeout=poll + 15, die_on_unreachable=False)
+        except Unreachable as e:
+            if outage_started is None:
+                outage_started = time.monotonic()
+                if not args.quiet:
+                    print("server unreachable (%s); retrying for up to %ds" % (e, RECONNECT_SECS),
+                          file=sys.stderr, flush=True)
+            if time.monotonic() - outage_started > RECONNECT_SECS:
+                die("server not reachable at %s for %ds; giving up" % (base_url(args), RECONNECT_SECS), 2)
+            time.sleep(1)
+            continue
+        if outage_started is not None and not args.quiet:
+            print("server back", file=sys.stderr, flush=True)
+        outage_started = None
+        default_since = res["latest_id"]
+        if unacked:
+            ack()
+        msgs = [m for m in res["messages"] if m["id"] > printed.get(m["channel"], 0)]
+        if msgs:
+            emit(msgs, args, show_channel=True)
+            for m in msgs:
+                printed[m["channel"]] = max(printed.get(m["channel"], 0), m["id"])
+                if not peek:
+                    unacked[m["channel"]] = max(unacked.get(m["channel"], 0), m["id"])
+            if since is not None:
+                since = msgs[-1]["id"]
+            if not peek:
+                ack()
+            if not follow:
+                return 0
+
+
+def cmd_follow(args):
+    return cmd_wait(args, follow=True)
+
+
+# ----------------------------------------------------------------- feed / subscriptions / channel
+
+def cmd_subscribe(args, on=True):
+    me = resolve_user(args)
+    key = resolve_channel(args, args.channel, must_exist=True)
+    r = api(args, "POST", "/api/subscriptions", body={"user": me, "channel": key, "remove": not on})
+    print("%s %s. Subscriptions: %s" % ("subscribed to" if on else "unsubscribed from", key, ", ".join(r["subscriptions"]) or "none"))
+    return 0
+
+
+def cmd_unsubscribe(args):
+    return cmd_subscribe(args, on=False)
+
+
+def cmd_subscriptions(args):
+    me = resolve_user(args)
+    r = api(args, "GET", "/api/subscriptions", {"as": me})
+    print("\n".join(r["subscriptions"]) if r["subscriptions"] else "no subscriptions (mb subscribe <channel>)")
+    return 0
+
+
+def cmd_feed(args):
+    """What the channel / `mb wait --feed` would deliver right now."""
+    me = resolve_user(args)
+    r = api(args, "GET", "/api/feed", {"as": me, "limit": 200})
+    msgs = r["messages"]
+    if not msgs and not getattr(args, "json", False):
+        print("nothing pending for %s (feed cursor #%s; subscriptions: %s)" % (me, r.get("cursor"), ", ".join(r.get("subscriptions") or []) or "none"))
+    emit(msgs, args, show_channel=True)
+    if msgs and not args.peek:
+        api(args, "POST", "/api/feed/ack", body={"user": me, "last_id": msgs[-1]["id"]})
+    return 0
+
+
+def feed_loop(args, follow):
+    me = resolve_user(args)
+    deadline = time.monotonic() + args.timeout if getattr(args, "timeout", None) else None
+    outage_started = None
+    if not args.quiet:
+        print("%s the feed as %s (mentions, DMs, replies in your threads, subscribed channels)%s"
+              % ("following" if follow else "waiting on", me, "; no timeout: exits only when something arrives" if not deadline else ""),
+              file=sys.stderr, flush=True)
+    while True:
+        poll = SERVER_MAX_POLL
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                if not args.quiet:
+                    print("timeout: nothing arrived", file=sys.stderr, flush=True)
+                return 124
+            poll = max(1, min(poll, int(remaining + 0.999)))
+        try:
+            api(args, "POST", "/api/presence", body={"user": me, "kind": "wait", "ttl": 90}, timeout=5, die_on_unreachable=False)
+            res = api(args, "GET", "/api/feed/wait", {"as": me, "timeout": poll, "limit": 200}, timeout=poll + 15, die_on_unreachable=False)
+        except Unreachable as e:
+            if outage_started is None:
+                outage_started = time.monotonic()
+                if not args.quiet:
+                    print("server unreachable (%s); retrying for up to %ds" % (e, RECONNECT_SECS), file=sys.stderr, flush=True)
+            if time.monotonic() - outage_started > RECONNECT_SECS:
+                die("server not reachable for %ds; giving up" % RECONNECT_SECS, 2)
+            time.sleep(1)
+            continue
+        if outage_started is not None and not args.quiet:
+            print("server back", file=sys.stderr, flush=True)
+        outage_started = None
+        msgs = res["messages"]
+        if msgs:
+            emit(msgs, args, show_channel=True)
+            for _ in range(5):
+                try:
+                    api(args, "POST", "/api/feed/ack", body={"user": me, "last_id": msgs[-1]["id"]}, timeout=10, die_on_unreachable=False)
+                    break
+                except (Unreachable, SystemExit):
+                    time.sleep(1)
+            if not follow:
+                return 0
+
+
+CLAUDE_WAIT_PROMPT = """msgboard: you are @{name}{proj} on this machine; your identity is already set (`mb whoami` confirms it). \
+Claude Code channels are not available here, so you keep yourself reachable: load the msgboard skill if it is installed \
+(~/.claude/skills/msgboard/SKILL.md), run `mb brief`, then run `mb wait --feed` with the Bash tool in the background with no \
+timeout. It costs nothing while waiting and exits only when something for you arrives (mentions, DMs, replies in your threads, \
+subscribed channels{subs}): handle what it printed, answer on the board with mb (the authors read the board, not this terminal), \
+and re-arm the same command. Never poll or loop on it. Between deliveries work on your tasks. \
+Start now: brief, then arm the wait, then introduce yourself briefly in {intro}."""
+
+
+def cmd_claude(args):
+    """Start Claude Code for this agent: with the msgboard channel (events pushed into the session), or, where channels
+    are not available (Bedrock / remote machines, or --no-channel), with an opening prompt that makes the session arm
+    `mb wait --feed` itself."""
+    project = args.project or os.environ.get("MB_PROJECT") or resolve_project(args)
+    name = getattr(args, "as_", None) or os.environ.get("MB_USER") or auto_name()
+    wait_mode = bool(args.no_channel or REMOTE or os.environ.get("CLAUDE_CODE_USE_BEDROCK") == "1"
+                     or os.environ.get("CLAUDE_CODE_USE_VERTEX") == "1" or os.environ.get("CLAUDE_CODE_USE_FOUNDRY") == "1")
+    env = dict(os.environ, MB_USER=name)
+    if not wait_mode:
+        env["MB_CHANNEL"] = "1"
+    if project:
+        env["MB_PROJECT"] = project
+    body = {"name": name, "cwd": os.getcwd()}
+    if project:
+        body["project"] = project
+    if args.status:
+        body["status"] = args.status
+    u = api(args, "POST", "/api/users", body=body)
+    if project:
+        api(args, "POST", "/api/projects", body={"name": project, "user": name})
+    subs = []
+    if wait_mode and project and not args.no_watch:
+        subs.append(project + "/general")  # no channel to arm subscriptions from inside: the project chat is on from the start
+    for ch in [c for c in (args.watch or "").replace(",", " ").split() if c]:
+        key = resolve_channel(argparse.Namespace(as_=name, project=project, url=getattr(args, "url", None), token=getattr(args, "token", None)), ch, must_exist=True)
+        if key not in subs:
+            subs.append(key)
+    for key in subs:
+        api(args, "POST", "/api/subscriptions", body={"user": name, "channel": key})
+    extra = list(args.claude_args)
+    if extra and extra[0] == "--":
+        extra = extra[1:]
+    cmd = ["claude"] + ([] if args.safe else ["--dangerously-skip-permissions"]) + extra
+    print("msgboard: %s %s as %s %s%s" % (u["emoji"], "starting Claude Code", name, ("in project " + project) if project else "",
+                                        ("; subscribed to " + ", ".join(subs)) if subs else ""), file=sys.stderr)
+    if wait_mode:
+        why = "--no-channel" if args.no_channel else ("remote machine" if REMOTE else "third-party API provider")
+        print("msgboard: no channel here (%s: Claude Code channels need Anthropic auth and are not available on Bedrock/Vertex/"
+              "Foundry); the session arms `mb wait --feed` itself from an opening prompt and is woken once per delivery" % why,
+              file=sys.stderr)
+        cmd.append(CLAUDE_WAIT_PROMPT.format(name=name, proj=(" in project " + project) if project else "",
+                                             subs=(": " + ", ".join(subs)) if subs else "",
+                                             intro=(project + "/general") if project else "main/general"))
+    else:
+        spec = PLUGIN_SPEC
+        flag = "--channels" if args.official else "--dangerously-load-development-channels"
+        cmd[1:1] = [flag, spec]
+        print("msgboard: board events for @%s will arrive in the session (mentions, DMs, replies in your threads%s)"
+              % (name, ", subscribed channels" if subs else ""), file=sys.stderr)
+        if not args.official:
+            print("msgboard: confirm the development-channels dialog with \"I am using this for local development\"", file=sys.stderr)
+    if not args.safe:
+        print("msgboard: permissions are bypassed (--dangerously-skip-permissions); use --safe to keep prompts", file=sys.stderr)
+    try:
+        os.execvpe(cmd[0], cmd, env)
+    except OSError as e:
+        die("cannot start claude: %s" % e)
+
+
+MARKETPLACE = "msgboard"  # name in marketplace/.claude-plugin/marketplace.json
+PLUGIN_SPEC = "plugin:msgboard@" + MARKETPLACE
+
+
+def cmd_plugin(args):
+    mp = os.path.join(HERE, "marketplace")
+    if args.action == "install":
+        known = subprocess.run(["claude", "plugin", "marketplace", "list"], capture_output=True, text=True).stdout
+        if not re.search(r"(?m)^\s*(❯\s*)?%s\s*$" % re.escape(MARKETPLACE), known):
+            r = subprocess.run(["claude", "plugin", "marketplace", "add", mp], capture_output=True, text=True)
+            print((r.stdout or r.stderr).strip()[-300:])
+        r = subprocess.run(["claude", "plugin", "install", "msgboard@" + MARKETPLACE, "--scope", "user"], capture_output=True, text=True)
+        if r.returncode != 0:
+            r = subprocess.run(["claude", "plugin", "install", "msgboard@" + MARKETPLACE], capture_output=True, text=True)
+        print((r.stdout or r.stderr).strip()[-400:])
+        print("start sessions with:  mb claude -p <project>   (or: claude --dangerously-load-development-channels %s)" % PLUGIN_SPEC)
+        return r.returncode
+    if args.action == "update":
+        for cmd in (["claude", "plugin", "marketplace", "update", MARKETPLACE], ["claude", "plugin", "update", "msgboard@" + MARKETPLACE]):
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            print((r.stdout or r.stderr).strip()[-300:])
+        return 0
+    if args.action == "uninstall":
+        r = subprocess.run(["claude", "plugin", "uninstall", "msgboard@" + MARKETPLACE], capture_output=True, text=True)
+        print((r.stdout or r.stderr).strip()[-300:])
+        return 0
+    r = subprocess.run(["claude", "plugin", "list"], capture_output=True, text=True)
+    lines = [l for l in r.stdout.splitlines() if "msgboard" in l]
+    print("\n".join(lines) if lines else "msgboard plugin not installed (mb plugin install)")
+    return 0
+
+
+# ----------------------------------------------------------------- orientation: brief / who / areas / profile / groups / watch / state
+
+def cmd_brief(args):
+    me = resolve_user(args)
+    b = api(args, "GET", "/api/brief", {"as": me, "project": args.project or resolve_project(args)})
+    print(b["text"])
+    return 0
+
+
+def cmd_who(args):
+    rows = api(args, "GET", "/api/who", {"q": " ".join(args.topic), "project": None if args.everywhere else (args.project or resolve_project(args))})
+    if not rows:
+        print("nobody has evidence about %r yet (no PRs, reviews, tasks or messages mention it)" % " ".join(args.topic))
+    for r in rows:
+        print("%s%-20s %5.1f  %s%s" % ("● " if r["live"] else "  ", r["user"] + (" (human)" if r["human"] else ""), r["score"],
+                                      "; ".join(r["proof"]), ('  status: "%s"' % r["status"]) if r["status"] else ""))
+    if rows:
+        print("(● = live now; score from areas, PRs authored/reviewed, tasks, messages)")
+    return 0
+
+
+def cmd_areas(args):
+    me = getattr(args, "of", None) or resolve_user(args)
+    add = [w.lstrip("+") for w in args.ops if not w.startswith(("-", "~"))]
+    remove = [w[1:] for w in args.ops if w.startswith(("-", "~"))]
+    if add or remove:
+        r = api(args, "POST", "/api/users/%s/areas" % me, body={"user": me, "add": add, "remove": remove})
+    else:
+        r = api(args, "GET", "/api/users/%s/areas" % me)
+    if not r["areas"]:
+        print("%s has no areas yet: they come from PR tags, reviews and tagged tasks; add by hand with mb areas +gateway" % me)
+    for a in r["areas"]:
+        print("%-24s %5.0f%s" % (a["area"], a["score"], "  (set by hand)" if a["manual"] == 1 else ""))
+    return 0
+
+
+def cmd_profile(args):
+    me = args.user or resolve_user(args)
+    pf = api(args, "GET", "/api/users/%s/profile" % me)
+    u = pf["user"]
+    print("%s %s%s  %s  project %s  %s" % (u["emoji"], me, " (human)" if u["human"] else "", "● live" if u["live"] else rel(u["last_seen"]),
+                                           u["project"] or "-", ('"%s"' % u["status"]) if u["status"] else ""))
+    print("areas:   " + (", ".join("%s(%d)" % (a["area"], round(a["score"])) for a in pf["areas"]) or "-"))
+    print("PRs:     " + ("; ".join("#%d %s (%s)" % (x["id"], x["title"][:35], x["status"]) for x in pf["prs"][:6]) or "-") + "   reviews given: %d   answers: %d" % (pf["reviews"], pf["answers"]))
+    print("tasks:   " + ("; ".join("#%d %s (%s)" % (t["id"], t["title"][:35], t["status"]) for t in pf["tasks"][:6]) or "-"))
+    print("active in: " + (", ".join("%s(%d)" % (c["channel"], c["n"]) for c in pf["channels"]) or "-") + "   groups: " + (", ".join(pf["groups"]) or "-"))
+    return 0
+
+
+def cmd_group(args):
+    me = resolve_user(args, required=False) or "gui"
+    project = args.project or resolve_project(args) or DEFAULT_PROJECT
+    a = args.action
+    if a in ("list", None) or (a == "list"):
+        rows = api(args, "GET", "/api/groups", {"project": None if args.all_projects else project})
+        if not rows:
+            print("no groups in %s (mb group add <name> <user...>)" % project)
+        for g in rows:
+            print("@%-18s %s   (%s)" % (g["name"], ", ".join(g["members"]) or "-", g["project"]))
+        return 0
+    if not args.name:
+        die("usage: mb group add|remove|rm <name> [users...]")
+    if a == "add":
+        if not args.users:
+            die("usage: mb group add <name> <user> [user ...]")
+        r = api(args, "POST", "/api/groups", body={"user": me, "project": project, "name": args.name, "add": args.users})
+    elif a == "remove":
+        r = api(args, "POST", "/api/groups", body={"user": me, "project": project, "name": args.name, "remove": args.users})
+    elif a == "rm":
+        r = api(args, "POST", "/api/groups", body={"user": me, "project": project, "name": args.name, "delete": True})
+    else:
+        die("unknown group action")
+    g = next((x for x in r["groups"] if x["name"] == args.name), None)
+    print("@%s = %s" % (args.name, ", ".join(g["members"]) if g else "(deleted)") + "   mention it to wake every member")
+    return 0
+
+
+def cmd_watch(args, mode="watch"):
+    me = resolve_user(args)
+    r = api(args, "POST", "/api/messages/%d/watch" % args.id, body={"user": me, "mode": mode})
+    print({"watch": "watching thread #%d: its replies now wake you", "mute": "muted thread #%d: its replies no longer wake you (direct mentions still do)",
+           "off": "thread #%d back to default"}[mode] % r["root"])
+    return 0
+
+
+def cmd_mute(args):
+    return cmd_watch(args, "mute")
+
+
+def cmd_unwatch(args):
+    return cmd_watch(args, "off")
+
+
+def cmd_state(args):
+    me = resolve_user(args)
+    key = resolve_channel(args, args.channel, must_exist=True)
+    text = "" if args.clear else " ".join(args.text)
+    if not text and not args.clear:
+        die("usage: mb state <channel> \"one line: where this channel's work stands\"   (or --clear)")
+    ch = api(args, "POST", "/api/channels/%s/state" % urllib.parse.quote(key, safe=""), body={"user": me, "state": text})
+    print("%s state: %s" % (ch["key"], ch["state"] or "(cleared)"))
+    return 0
+
+
+# ----------------------------------------------------------------- dispatch: wake any CLI agent (Codex, claude -p, custom) when the board has something for it
+
+DISPATCH_PROMPT = """You are agent "{name}" on msgboard, the local message board where Claude Code and Codex agents and the humans coordinate. Project: {project}.
+Your board identity is already set (MB_USER / MB_PROJECT in your environment). Use the `mb` CLI directly (`mb -h`): mb reply <id> "...", mb answer <id> "...", mb send <channel> "...", mb pr show <id>, mb thread <id>, mb read <channel> --unread, mb inbox, mb who <topic>, mb brief. The senders read the board, not your output: anything they must see has to be posted with mb. Never run `mb wait`, `mb follow` or any polling loop: you are started again whenever something new arrives for you. When you have done what these messages need (and posted the result), finish.
+{guide}
+=== Briefing ===
+{brief}
+{items}{kickoff}"""
+
+
+def dispatch_log(name, line):
+    d = os.path.join(DATA_DIR, "dispatch")
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, name + ".log"), "a") as f:
+        f.write("%s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), line))
+
+
+def dispatch_state_path(name):
+    d = os.path.join(DATA_DIR, "dispatch")
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, name + ".json")
+
+
+def run_agent(args, name, project, prompt, state):
+    """Run one agent turn with `prompt`. Returns (exit_code, last_message). Keeps session continuity in `state`."""
+    env = dict(os.environ, MB_USER=name, MB_PROJECT=project)
+    for k in ("CLAUDE_CODE_SESSION_ID", "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN"):
+        env.pop(k, None)
+    cwd = args.cwd or os.getcwd()
+    d = os.path.join(DATA_DIR, "dispatch")
+    last_file = os.path.join(d, name + ".last")
+    agent = args.agent
+    if agent == "codex":
+        base = ["codex", "exec", "--skip-git-repo-check", "-C", cwd, "--json", "-o", last_file, "--color", "never",
+                "-c", "sandbox_workspace_write.network_access=true"]  # mb talks to the board on loopback
+        if args.model:
+            base += ["-m", args.model]
+        if args.full_access:
+            base += ["--dangerously-bypass-approvals-and-sandbox"]
+        elif args.approve:
+            base += ["--approve-for-me"]  # implies the workspace-write sandbox; refuses an explicit --sandbox
+        else:
+            base += ["-s", args.sandbox or "workspace-write"]
+        sid = state.get("codex_thread") if not args.no_resume else None
+        cmd = base + (["resume", sid, "-"] if sid else ["-"])
+        r = subprocess.run(cmd, input=prompt, capture_output=True, text=True, env=env, cwd=cwd, timeout=args.run_timeout)
+        if sid and r.returncode != 0 and ("not found" in (r.stderr + r.stdout).lower() or "no session" in (r.stderr + r.stdout).lower()):
+            dispatch_log(name, "codex resume of %s failed; starting a fresh thread" % sid)
+            state.pop("codex_thread", None)
+            r = subprocess.run(base + ["-"], input=prompt, capture_output=True, text=True, env=env, cwd=cwd, timeout=args.run_timeout)
+        if not args.no_resume:
+            for line in (r.stdout or "").splitlines():
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    continue
+                tid = ev.get("thread_id") or (ev.get("thread") or {}).get("id") or ev.get("session_id")
+                if tid and ev.get("type", "").startswith("thread"):
+                    state["codex_thread"] = tid
+                    break
+        last = ""
+        try:
+            with open(last_file) as f:
+                last = f.read().strip()
+        except OSError:
+            pass
+        if r.returncode != 0:
+            dispatch_log(name, "codex exit %s: %s" % (r.returncode, (r.stderr or "").strip()[-600:]))
+        return r.returncode, last
+    if agent == "claude":
+        base = ["claude", "-p", "--output-format", "json"]
+        if args.full_access:
+            base += ["--dangerously-skip-permissions"]
+        else:
+            # print mode has nobody to approve prompts: pre-authorize the board CLI (and edits), deny nothing else explicitly
+            base += ["--permission-mode", args.permission_mode or "acceptEdits",
+                     "--allowedTools", "Bash(mb:*)", "--allowedTools", "Bash(%s:*)" % os.path.join(HERE, "mb")]
+        if args.model:
+            base += ["--model", args.model]
+        sid = state.get("claude_session") if not args.no_resume else None
+        cmd = base + (["--resume", sid] if sid else [])
+        r = subprocess.run(cmd, input=prompt, capture_output=True, text=True, env=env, cwd=cwd, timeout=args.run_timeout)
+        if sid and r.returncode != 0:
+            dispatch_log(name, "claude resume of %s failed (%s); starting fresh" % (sid, (r.stderr or "").strip()[-200:]))
+            state.pop("claude_session", None)
+            r = subprocess.run(base, input=prompt, capture_output=True, text=True, env=env, cwd=cwd, timeout=args.run_timeout)
+        last = ""
+        try:
+            out = json.loads(r.stdout or "{}")
+            if isinstance(out, dict):
+                last = out.get("result") or ""
+                if out.get("session_id") and not args.no_resume:
+                    state["claude_session"] = out["session_id"]
+        except ValueError:
+            last = (r.stdout or "").strip()[-2000:]
+        if r.returncode != 0:
+            dispatch_log(name, "claude exit %s: %s" % (r.returncode, (r.stderr or "").strip()[-600:]))
+        return r.returncode, last
+    # generic command: {prompt_file} placeholder or prompt on stdin
+    pf = os.path.join(d, name + ".prompt")
+    with open(pf, "w") as f:
+        f.write(prompt)
+    cmd = (args.agent_cmd or "cat {prompt_file}").replace("{prompt_file}", pf)
+    r = subprocess.run(cmd, shell=True, input=prompt, capture_output=True, text=True, env=env, cwd=cwd, timeout=args.run_timeout)
+    if r.returncode != 0:
+        dispatch_log(name, "cmd exit %s: %s" % (r.returncode, (r.stderr or "").strip()[-600:]))
+    return r.returncode, (r.stdout or "").strip()[-2000:]
+
+
+def cmd_dispatch(args):
+    name = getattr(args, "as_", None) or os.environ.get("MB_USER") or auto_name()
+    project = args.project or os.environ.get("MB_PROJECT") or resolve_project(args) or DEFAULT_PROJECT
+    args.as_ = name
+    args.project = project
+    if not args.safe and not args.approve:
+        args.full_access = True  # default: no sandbox, no approval prompts (--safe or --approve to keep them)
+    api(args, "POST", "/api/users", body={"name": name, "project": project, "cwd": args.cwd or os.getcwd(),
+                                          "status": args.status or "dispatch: waiting for work"})
+    api(args, "POST", "/api/projects", body={"name": project, "user": name})
+    for ch in [c for c in (args.watch or "").replace(",", " ").split() if c]:
+        key = resolve_channel(args, ch, must_exist=True)
+        api(args, "POST", "/api/subscriptions", body={"user": name, "channel": key})
+    try:
+        with open(dispatch_state_path(name)) as f:
+            state = json.load(f)
+    except (OSError, ValueError):
+        state = {}
+    if args.fresh:
+        state = {}
+    guide_path = os.path.join(HERE, "AGENTS.md")
+    guide = ""
+    if args.guide and os.path.exists(guide_path):
+        with open(guide_path) as f:
+            guide = "\n=== Board guide (AGENTS.md) ===\n" + f.read() + "\n"
+    runs = 0
+    stop = {"flag": False}
+
+    def on_term(signum, _f):
+        stop["flag"] = True
+        print("dispatch: stopping after the current run", file=sys.stderr, flush=True)
+
+    signal.signal(signal.SIGTERM, on_term)
+    signal.signal(signal.SIGINT, on_term)
+
+    def save_state():
+        with open(dispatch_state_path(name), "w") as f:
+            json.dump(state, f, indent=1)
+
+    def heartbeat():
+        try:
+            api(args, "POST", "/api/presence", body={"user": name, "project": project, "kind": "dispatch", "ttl": 90}, timeout=5, die_on_unreachable=False)
+        except (Unreachable, SystemExit):
+            pass
+
+    def do_run(items, kickoff=""):
+        nonlocal runs
+        runs += 1
+        try:
+            brief = api(args, "GET", "/api/brief", {"as": name, "project": project})["text"]
+        except SystemExit:
+            brief = "(briefing unavailable)"
+        lines = []
+        for m in items:
+            lines.append(fmt_msg(m, show_channel=True) + ("   [why: %s]" % ",".join(m.get("why") or []) if m.get("why") else ""))
+        items_txt = ("\n=== New on msgboard for you (%d) ===\n%s\n" % (len(items), "\n".join(lines))) if items else ""
+        kick = ("\n=== Instructions from the operator ===\n%s\n" % kickoff) if kickoff else ""
+        prompt = DISPATCH_PROMPT.format(name=name, project=project, guide=guide, brief=brief, items=items_txt, kickoff=kick)
+        api(args, "POST", "/api/users", body={"name": name, "status": "dispatch: handling %d item%s" % (len(items), "" if len(items) == 1 else "s") if items else "dispatch: kickoff run"})
+        dispatch_log(name, "run %d start: %d item(s)%s" % (runs, len(items), " + kickoff" if kickoff else ""))
+        if not args.quiet:
+            print("dispatch: run %d (%s) with %d item%s%s" % (runs, args.agent, len(items), "" if len(items) == 1 else "s", " + kickoff" if kickoff else ""), file=sys.stderr, flush=True)
+        t0 = time.time()
+        try:
+            code, last = run_agent(args, name, project, prompt, state)
+        except subprocess.TimeoutExpired:
+            code, last = 124, "(run timed out after %ds)" % args.run_timeout
+        save_state()
+        dispatch_log(name, "run %d end: exit %s in %ds; last: %s" % (runs, code, time.time() - t0, (last or "").replace("\n", " ")[:300]))
+        if not args.quiet:
+            print("dispatch: run %d done (exit %s, %ds)%s" % (runs, code, time.time() - t0, (": " + last.replace("\n", " ")[:160]) if last else ""), file=sys.stderr, flush=True)
+        api(args, "POST", "/api/users", body={"name": name, "status": "dispatch: waiting for work (last run %s)" % time.strftime("%H:%M")})
+        return code
+
+    if args.kickoff:
+        do_run([], args.kickoff)
+        if args.once:
+            return 0
+    if not args.quiet:
+        print("dispatch: %s as %s in %s: waiting on the feed (zero cost while idle); Ctrl-C to stop" % (args.agent, name, project), file=sys.stderr, flush=True)
+    outage_started = None
+    while not stop["flag"]:
+        heartbeat()
+        try:
+            res = api(args, "GET", "/api/feed/wait", {"as": name, "timeout": SERVER_MAX_POLL, "limit": 200}, timeout=SERVER_MAX_POLL + 15, die_on_unreachable=False)
+        except Unreachable as e:
+            if outage_started is None:
+                outage_started = time.monotonic()
+                print("dispatch: board unreachable (%s); retrying" % e, file=sys.stderr, flush=True)
+            time.sleep(min(60, 2 + (time.monotonic() - outage_started) / 10))
+            continue
+        outage_started = None
+        items = res.get("messages") or []
+        if not items:
+            continue
+        time.sleep(2)
+        try:
+            more = api(args, "GET", "/api/feed", {"as": name, "since": items[-1]["id"], "limit": 100}, die_on_unreachable=False)
+            items += more.get("messages") or []
+        except (Unreachable, SystemExit):
+            pass
+        do_run(items)
+        for _ in range(5):
+            try:
+                api(args, "POST", "/api/feed/ack", body={"user": name, "last_id": max(m["id"] for m in items)}, timeout=10, die_on_unreachable=False)
+                break
+            except (Unreachable, SystemExit):
+                time.sleep(1)
+        if args.once or (args.max_runs and runs >= args.max_runs):
+            break
+    try:
+        api(args, "POST", "/api/presence", body={"user": name, "state": "offline"}, timeout=3, die_on_unreachable=False)
+        api(args, "POST", "/api/users", body={"name": name, "status": "dispatch stopped"}, timeout=3, die_on_unreachable=False)
+    except (Unreachable, SystemExit):
+        pass
+    return 0
+
+
+CODEX_AGENTS_NOTE = """
+# msgboard (agent message board)
+You may be part of a swarm that coordinates on msgboard, a local message board with the `mb` CLI. If `mb whoami` prints
+a name you are already registered (otherwise `mb join <name> -p <project>` binds this Codex thread): start with `mb brief`, then act with `mb inbox`, `mb read <channel> --unread`,
+`mb send <channel> "..."`, `mb reply <id> "..."`, `mb ask @name "..."`, `mb pr add <url> "title" --tldr "..." --tags ...`,
+`mb task add "..." --take`, `mb who <topic>`. Posting is how the others (and the human) see your work. Board events for you
+(mentions, DMs, replies in your threads, subscribed channels) arrive in this session as messages that start with `msgboard:`:
+act on them and answer on the board; their authors do not see this terminal. Never poll or loop on `mb wait`; when you have
+nothing left to do, finish: you are woken again when something new arrives. Full guide: ~/msgboard/AGENTS.md
+"""
+
+
+CODEX_HOME = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+CODEX_PUSH_LOG = os.path.join(DATA_DIR, "codex-push.log")
+UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+def codex_logger(name):
+    def log(msg):
+        try:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            with open(CODEX_PUSH_LOG, "a") as f:
+                f.write("%s %s: %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), name, msg))
+        except OSError:
+            pass
+    return log
+
+
+def codex_threads_since(t0):
+    """Ids of Codex TUI threads whose reference/lock file appeared at or after t0, newest first."""
+    found = {}
+    for d, suffix in (("tui-thread-reference-capabilities", ""), ("thread-writer-locks", ".lock")):
+        path = os.path.join(CODEX_HOME, d)
+        try:
+            names = os.listdir(path)
+        except OSError:
+            continue
+        for f in names:
+            tid = f[:-len(suffix)] if suffix and f.endswith(suffix) else f
+            if not UUID_RE.match(tid):
+                continue
+            try:
+                mt = os.stat(os.path.join(path, f)).st_mtime
+            except OSError:
+                continue
+            if mt >= t0 - 1:
+                found[tid] = max(mt, found.get(tid, 0))
+    return [tid for tid, _ in sorted(found.items(), key=lambda kv: -kv[1])]
+
+
+def codex_tui_pids():
+    """pids of interactive Codex TUIs (the codex binary without a subcommand), newest first."""
+    try:
+        out = subprocess.run(["ps", "-axo", "pid=,etime=,command="], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    subcommands = {"exec", "e", "review", "login", "logout", "mcp", "plugin", "app-server", "remote-control", "app", "completion",
+                   "update", "doctor", "sandbox", "debug", "apply", "a", "resume", "queue", "archive", "delete", "unarchive",
+                   "fork", "cloud", "exec-server", "features", "help", "agents", "migrate-rollouts"}
+    rows = []
+    for line in out.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        pid, etime, cmd = parts
+        argv = cmd.split()
+        if not argv or not (argv[0] == "codex" or argv[0].endswith("/bin/codex")):
+            continue
+        if any(a in subcommands for a in argv[1:] if not a.startswith("-")):
+            continue
+        secs = 0
+        days, _, hms = etime.rpartition("-")
+        for part in hms.split(":"):
+            secs = secs * 60 + int(part or 0)
+        secs += int(days or 0) * 86400
+        rows.append((secs, int(pid)))
+    return [pid for _, pid in sorted(rows)]
+
+
+def codex_subscribe(args, name, project):
+    """Subscribe the session to <project>/general (unless --no-watch) plus --watch channels."""
+    chans = [c for c in (getattr(args, "watch", None) or "").replace(",", " ").split() if c]
+    subs = []
+    if project and not getattr(args, "no_watch", False):
+        subs.append(project + "/general")
+    for ch in chans:
+        key = resolve_channel(argparse.Namespace(as_=name, project=project, url=getattr(args, "url", None), token=getattr(args, "token", None)),
+                              ch, must_exist=True)
+        if key not in subs:
+            subs.append(key)
+    for key in subs:
+        api(args, "POST", "/api/subscriptions", body={"user": name, "channel": key})
+    return subs
+
+
+def codex_push_text(name, project, msgs):
+    head = ("msgboard: %d new board event%s for @%s%s. Act on them with the mb CLI (mb reply <id> \"...\", mb send <channel> \"...\", "
+            "mb thread <id> for the full context). The authors read the board, not this terminal; not every message needs a reply."
+            % (len(msgs), "" if len(msgs) == 1 else "s", name, (" in project " + project) if project else ""))
+    lines = [head]
+    for m in msgs:
+        why = ",".join(m.get("why") or [])
+        lines.append(fmt_msg(m, True) + ((" [" + why + "]") if why else ""))
+    return "\n".join(lines)
+
+
+def codex_push_loop(args, name, project, thread, alive, log, since=None):
+    """Deliver the feed of `name` into Codex thread `thread` with `codex queue`. At-least-once: the feed cursor is
+    acknowledged only after the queue call succeeded; `since` delivers a catch-up first."""
+    last_hb = 0.0
+    failures = 0
+    while alive():
+        if time.time() - last_hb > 60:
+            try:
+                api(args, "POST", "/api/presence", body={"user": name, "project": project, "kind": "codex", "ttl": 150},
+                    timeout=5, die_on_unreachable=False)
+            except (Unreachable, SystemExit) as e:
+                log("presence: %s" % e)
+            last_hb = time.time()
+        try:
+            res = api(args, "GET", "/api/feed/wait", {"as": name, "since": since, "timeout": SERVER_MAX_POLL, "limit": 100},
+                      timeout=SERVER_MAX_POLL + 15, die_on_unreachable=False)
+        except (Unreachable, SystemExit) as e:
+            log("feed: %s" % e)
+            time.sleep(5)
+            continue
+        msgs = res.get("messages") or []
+        if not msgs or not alive():
+            continue
+        time.sleep(1.5)  # let a burst settle so it becomes one turn
+        try:
+            more = api(args, "GET", "/api/feed", {"as": name, "since": msgs[-1]["id"], "limit": 100}, timeout=10, die_on_unreachable=False)
+            msgs += more.get("messages") or []
+        except (Unreachable, SystemExit):
+            pass
+        text = codex_push_text(name, project, msgs)
+        try:
+            r = subprocess.run(["codex", "queue", "--thread", thread, "--message", text], capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            log("codex queue: %s" % e)
+            time.sleep(10)
+            continue
+        if r.returncode != 0:
+            failures += 1
+            log("codex queue failed (exit %d): %s" % (r.returncode, (r.stderr or r.stdout).strip()[-300:]))
+            time.sleep(min(10 * failures, 60))
+            continue
+        failures = 0
+        for _ in range(5):
+            try:
+                api(args, "POST", "/api/feed/ack", body={"user": name, "last_id": msgs[-1]["id"]}, timeout=10, die_on_unreachable=False)
+                break
+            except (Unreachable, SystemExit):
+                time.sleep(1)
+        since = None
+        log("queued %d event(s) up to #%d into thread %s" % (len(msgs), msgs[-1]["id"], thread))
+
+
+def codex_offline(args, name):
+    try:
+        api(args, "POST", "/api/presence", body={"user": name, "state": "offline"}, timeout=3, die_on_unreachable=False)
+    except (Unreachable, SystemExit):
+        pass
+
+
+def codex_attach(args, name, project):
+    """Push board events into a Codex TUI that is already running."""
+    thread = args.thread
+    if not thread:
+        # Never guess: the daemon keeps finished threads loaded, and a push into one runs a turn with no TUI behind it.
+        print("mb codex attach needs --thread <uuid> and --pid <codex pid>. Recent Codex TUI threads (newest first):", file=sys.stderr)
+        for tid in codex_threads_since(0)[:5]:
+            print("  --thread " + tid, file=sys.stderr)
+        for pid in codex_tui_pids()[:5]:
+            print("  --pid %d" % pid, file=sys.stderr)
+        print("(a running TUI's thread id: /status inside Codex, or the newest file in %s/tui-thread-reference-capabilities)" % CODEX_HOME,
+              file=sys.stderr)
+        return 2
+    if not UUID_RE.match(thread):
+        die("--thread must be a Codex thread uuid")
+    pid = args.pid
+    if not pid:
+        die("--pid <pid of the Codex TUI> is required: the attach must end when that TUI exits")
+    if pid:
+        def alive():
+            try:
+                os.kill(pid, 0)
+                return True
+            except OSError:
+                return False
+    else:
+        print("msgboard: no running codex TUI found; attaching anyway (Ctrl-C to stop)", file=sys.stderr)
+        alive = lambda: True
+    body = {"name": name, "cwd": os.getcwd()}
+    if project:
+        body["project"] = project
+    if args.status:
+        body["status"] = args.status
+    u = api(args, "POST", "/api/users", body=body)
+    if project:
+        api(args, "POST", "/api/projects", body={"name": project, "user": name})
+    subs = codex_subscribe(args, name, project)
+    save_identity(thread, name=name, project=project)
+    log = codex_logger(name)
+    print("msgboard: %s attaching @%s to Codex thread %s%s%s; board events are queued into it (Ctrl-C stops; log %s)"
+          % (u["emoji"], name, thread, (" (pid %d)" % pid) if pid else "", ("; subscribed to " + ", ".join(subs)) if subs else "", CODEX_PUSH_LOG),
+          file=sys.stderr)
+    log("attach -> thread %s pid %s since %s" % (thread, pid, args.since))
+    try:
+        codex_push_loop(args, name, project, thread, alive, log, since=args.since)
+    except KeyboardInterrupt:
+        pass
+    codex_offline(args, name)
+    log("detached")
+    return 0
+
+
+def cmd_codex(args):
+    """Start an interactive Codex session with a board identity; board events are queued into it with `codex queue`."""
+    if args.action == "install":
+        path = os.path.expanduser("~/.codex/AGENTS.md")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        cur = ""
+        try:
+            with open(path) as f:
+                cur = f.read()
+        except OSError:
+            pass
+        if "# msgboard (agent message board)" in cur:
+            print("already installed in %s" % path)
+            return 0
+        with open(path, "a") as f:
+            f.write(("\n" if cur and not cur.endswith("\n") else "") + CODEX_AGENTS_NOTE)
+        print("added the msgboard section to %s (every Codex session reads it; remove the section to undo)" % path)
+        return 0
+    if args.action == "uninstall":
+        path = os.path.expanduser("~/.codex/AGENTS.md")
+        try:
+            with open(path) as f:
+                cur = f.read()
+        except OSError:
+            print("nothing to remove")
+            return 0
+        i = cur.find("\n# msgboard (agent message board)")
+        if i < 0:
+            i = cur.find("# msgboard (agent message board)")
+        if i < 0:
+            print("not installed")
+            return 0
+        with open(path, "w") as f:
+            f.write(cur[:i].rstrip("\n") + "\n" if cur[:i].strip() else "")
+        print("removed from %s" % path)
+        return 0
+    project = args.project or os.environ.get("MB_PROJECT") or resolve_project(args)
+    name = getattr(args, "as_", None) or os.environ.get("MB_USER") or auto_name()
+    if args.action == "attach":
+        return codex_attach(args, name, project)
+    # Interactive Codex runs its shell commands in a shared daemon that inherits the environment of whichever session
+    # started it, so MB_USER/MB_PROJECT must not be in Codex's environment: the thread is bound in identities.json instead.
+    env = {k: v for k, v in os.environ.items() if k not in ("MB_USER", "MB_PROJECT")}
+    body = {"name": name, "cwd": os.getcwd()}
+    if project:
+        body["project"] = project
+    if args.status:
+        body["status"] = args.status
+    u = api(args, "POST", "/api/users", body=body)
+    if project:
+        api(args, "POST", "/api/projects", body={"name": project, "user": name})
+    subs = codex_subscribe(args, name, project)
+    cmd = ["codex"] + ([] if args.safe else ["--dangerously-bypass-approvals-and-sandbox"]) + list(args.codex_args)
+    print("msgboard: %s starting Codex as %s%s%s" % (u["emoji"], name, (" in project " + project) if project else "",
+                                                  ("; subscribed to " + ", ".join(subs)) if subs else ""), file=sys.stderr)
+    print("msgboard: this Codex thread is bound to @%s (mb whoami inside Codex shows it)" % name, file=sys.stderr)
+    if args.no_push:
+        print("msgboard: --no-push: board events are not delivered; tell Codex to run `mb inbox` / `mb feed`", file=sys.stderr)
+    else:
+        print("msgboard: board events for @%s (mentions, DMs, replies in your threads, subscribed channels) are queued into this "
+              "session as `msgboard:` messages; log: %s" % (name, CODEX_PUSH_LOG), file=sys.stderr)
+    if not args.safe:
+        print("msgboard: approvals and sandbox are bypassed (--dangerously-bypass-approvals-and-sandbox); use --safe to keep them", file=sys.stderr)
+    t0 = time.time()
+    try:
+        child = subprocess.Popen(cmd, env=env)
+    except OSError as e:
+        die("cannot start codex: %s" % e)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)  # Ctrl-C belongs to Codex
+    log = codex_logger(name)
+    alive = lambda: child.poll() is None
+
+    def pusher():
+        thread = None
+        while alive() and thread is None:
+            ids = codex_threads_since(t0)
+            if ids:
+                thread = ids[0]
+                if len(ids) > 1:
+                    log("several Codex threads appeared since launch (%s); using the newest" % ", ".join(ids))
+            else:
+                time.sleep(0.5)
+        if thread is None:
+            return
+        save_identity(thread, name=name, project=project)
+        if args.no_push:
+            log("launched codex pid %d as %s: thread %s bound, no pushes (--no-push)" % (child.pid, name, thread))
+            return
+        log("launched codex pid %d as %s; pushing board events into thread %s" % (child.pid, name, thread))
+        codex_push_loop(args, name, project, thread, alive, log)
+
+    threading.Thread(target=pusher, daemon=True).start()
+    rc = child.wait()
+    codex_offline(args, name)
+    log("codex exited (%s)" % rc)
+    return rc
+
+
+# ----------------------------------------------------------------- tasks
+
+def fmt_task(t):
+    return "#%-4d [%-5s %-14s] %-50s %s(%s, by %s, %s)" % (
+        t["id"], t["status"], t["owner"] or "-", t["title"][:50], ("[" + ",".join(t.get("tags") or []) + "] ") if t.get("tags") else "",
+        t["project"], t["created_by"], rel(t["updated"]))
+
+
+def cmd_task(args):
+    me = resolve_user(args)
+    a = args.action
+    if a == "add":
+        if not args.rest:
+            die("usage: mb task add \"title\" [--body TEXT] [-p PROJECT] [-c CHANNEL] [--take]")
+        channel = resolve_channel(args, args.channel, must_exist=True) if args.channel else ""
+        project = resolve_project(args) or (channel.split("/", 1)[0] if channel else DEFAULT_PROJECT)
+        t = api(args, "POST", "/api/tasks", body={"project": project, "channel": channel, "title": " ".join(args.rest),
+                                                  "body": args.body or "", "user": me, "take": bool(args.take), "tags": args.tags})
+        print("added task " + fmt_task(t))
+        return 0
+    if a in ("take", "drop", "done", "reopen", "show", "edit"):
+        if not args.rest or not args.rest[0].lstrip("#").isdigit():
+            die("usage: mb task %s <id>" % a)
+        tid = int(args.rest[0].lstrip("#"))
+        if a == "show":
+            t = api(args, "GET", "/api/tasks/%d" % tid)
+            print(fmt_task(t))
+            if t["body"]:
+                print("    " + t["body"].replace("\n", "\n    "))
+            return 0
+        body = {"action": a, "user": me}
+        if a == "edit":
+            if len(args.rest) > 1:
+                body["title"] = " ".join(args.rest[1:])
+            if args.body is not None:
+                body["body"] = args.body
+        t = api(args, "POST", "/api/tasks/%d" % tid, body=body)
+        print("%s task %s" % ({"take": "took", "drop": "released", "done": "finished", "reopen": "reopened", "edit": "edited"}[a], fmt_task(t)))
+        return 0
+    die("unknown task action %r (add | take | drop | done | reopen | show | edit)" % a)
+
+
+def cmd_tasks(args):
+    me = resolve_user(args, required=False)
+    project = None if args.all else (args.project or resolve_project(args))
+    rows = api(args, "GET", "/api/tasks", {"project": project, "owner": me if args.mine else None})
+    if not args.done and not args.all:
+        rows = [t for t in rows if t["status"] != "done"]
+    if not rows:
+        print("no tasks" + (" in %s" % project if project else "") + " (add one: mb task add \"title\")")
+    for t in rows:
+        print(fmt_task(t))
+    return 0
+
+
+# ----------------------------------------------------------------- pull requests / bundles
+
+PR_URL_RE = re.compile(r"^https?://\S+$")
+
+
+def prio(p):
+    """priority 1..100, 1 = merge first (shown as p7, p50 ...)."""
+    return "%-4s" % ("p%d" % p)
+
+
+def fmt_review_state(pr):
+    if not pr.get("reviews"):
+        return "review: pending"
+    bits = []
+    if pr.get("approvals"):
+        bits.append("✅%d %s" % (pr["approvals"], ",".join(pr.get("approvers", []))))
+    if pr.get("changes_requested"):
+        bits.append("🔁%d" % pr["changes_requested"])
+    if pr.get("rejections"):
+        bits.append("⛔%d" % pr["rejections"])
+    if pr.get("stale_reviews"):
+        bits.append("(%d stale)" % pr["stale_reviews"])
+    return "review: " + (" ".join(bits) or "pending (stale verdicts only)")
+
+
+def fmt_pr(pr, show_url=True):
+    bundle = (" bundle #%d %s" % (pr["bundle_id"], ("\"%s\"" % pr["bundle_title"]) if pr.get("bundle_title") else "")) if pr.get("bundle_id") else ""
+    line = "#%-4d %s %-7s %-48s %s%s  by %s  %d comment%s  %s  %s" % (
+        pr["id"], prio(pr["priority"]), pr["status"], pr["title"][:48],
+        ("[" + ", ".join(pr["tags"]) + "]") if pr["tags"] else "", bundle, pr["author"], pr["comments"],
+        "" if pr["comments"] == 1 else "s", fmt_review_state(pr), rel(pr["updated"]))
+    if pr.get("tldr"):
+        line += "\n      TL;DR: " + pr["tldr"]
+    else:
+        line += "\n      ⚠ no TL;DR yet (author: mb pr tldr %d \"what it does and why, in plain words\")" % pr["id"]
+    if show_url and pr.get("url"):
+        line += "\n      " + pr["url"]
+    return line
+
+
+def fmt_bundle(b):
+    return "#%-4d %s %-7s %-40s %d/%d merged  %s  by %s  %d comment%s  %s" % (
+        b["id"], prio(b["priority"]), b["status"], b["title"][:40], b["merged_count"], b["pr_count"],
+        ("[" + ", ".join(b["tags"]) + "]") if b["tags"] else "", b["created_by"], b["comments"],
+        "" if b["comments"] == 1 else "s", rel(b["updated"]))
+
+
+def print_thread(replies, root, hint):
+    print("--- discussion (thread #%d). %s" % (root["id"], hint) if root else "--- (no discussion thread)")
+    for r in replies:
+        print("  " + fmt_msg(r, show_channel=False).replace("\n", "\n  "))
+    if root and not replies:
+        print("  (no comments yet)")
+
+
+def pr_wait(args, root_id, label):
+    ns = argparse.Namespace(channel=None, project=None, mention=False, reply_to=root_id, no_threads=False, since=None,
+                            peek=False, all=False, timeout=getattr(args, "timeout", None), quiet=False,
+                            as_=getattr(args, "as_", None), url=getattr(args, "url", None),
+                            token=getattr(args, "token", None), json=getattr(args, "json", False))
+    print("(%s: every reply after the entry is returned at once; then new ones as they land)" % label, file=sys.stderr)
+    return cmd_wait(ns)
+
+
+def split_tag_ops(words):
+    add, remove = [], []
+    for w in words:
+        for t in w.split(","):
+            t = t.strip()
+            if not t:
+                continue
+            if t.startswith("-") or t.startswith("~"):
+                remove.append(t[1:])
+            else:
+                add.append(t.lstrip("+"))
+    return add, remove
+
+
+def cmd_pr(args):
+    a = args.action
+    rest = list(args.rest)
+    project = resolve_project(args)
+    if a == "add":
+        me = resolve_user(args)
+        url = args.pr_url or ""
+        if rest and PR_URL_RE.match(rest[0]):
+            url = rest.pop(0)
+        title = args.title or " ".join(rest)
+        if not title:
+            die("usage: mb pr add <url> \"title\" --tldr \"...\" [--tags a,b] [--priority 1-100] [--bundle \"name\"|id] [--body ...|--file F]")
+        if not args.tldr:
+            die("--tldr is required: 1-3 plain sentences for someone who has not read the code: WHAT the PR does and WHY it "
+                "matters, no jargon or file names. Example: --tldr \"Makes the login token refresh itself before it expires, "
+                "so people stop getting logged out mid-session. Support tickets about random logouts doubled last week.\"")
+        body = args.body or ""
+        if args.file:
+            with open(args.file) as f:
+                body = f.read()
+        pr = api(args, "POST", "/api/prs", body={"user": me, "project": project or DEFAULT_PROJECT, "title": title,
+                                                  "url": url, "body": body, "tldr": args.tldr, "tags": args.tags, "priority": args.priority,
+                                                  "bundle": args.bundle, "branch": args.branch or "", "base": args.base or "",
+                                                  "status": args.status or "open"})
+        print("registered PR " + fmt_pr(pr))
+        print("discuss: mb pr comment %d \"...\"   |   wait for comments: mb pr wait %d   |   when merged: mb pr merged %d"
+              % (pr["id"], pr["id"], pr["id"]))
+        return 0
+    if a == "list":
+        me = resolve_user(args, required=False)
+        rows = api(args, "GET", "/api/prs", {"project": None if args.all_projects else project,
+                                             "status": args.status or "active", "tag": args.tag,
+                                             "author": me if args.mine else None, "q": args.query,
+                                             "review": args.review})
+        if args.no_tldr:
+            rows = [r for r in rows if not r.get("tldr")]
+        if not rows:
+            print("no PRs" + (" matching" if (args.tag or args.query or args.no_tldr) else "") + (" (status %s)" % (args.status or "active")))
+        for pr in rows:
+            print(fmt_pr(pr))
+        return 0
+    if a == "tags":
+        for t in api(args, "GET", "/api/tags", {"project": None if args.all_projects else project}):
+            print("%-24s %3d active  %3d total" % (t["tag"], t["active"], t["total"]))
+        return 0
+    if a == "sync":
+        me = resolve_user(args, required=False)
+        r = api(args, "POST", "/api/prs/sync", body={"project": None if args.all_projects else project, "user": me or "msgboard"},
+                timeout=600)
+        print("checked %d PR%s on GitHub; updated: %s%s" % (r["checked"], "" if r["checked"] == 1 else "s",
+                                                             ", ".join("#%d -> %s" % (u["id"], u["status"]) for u in r["updated"]) or "nothing",
+                                                             ("; errors: " + " | ".join(r["errors"])) if r["errors"] else ""))
+        return 0
+    # the rest need an id
+    if not rest or not rest[0].lstrip("#").isdigit():
+        die("usage: mb pr %s <id> ..." % a)
+    pid = int(rest.pop(0).lstrip("#"))
+    if a == "show":
+        me = resolve_user(args, required=False)
+        d = api(args, "GET", "/api/prs/%d" % pid)
+        pr, b = d["pr"], d["bundle"]
+        print("PR #%d  %s  %s   %s" % (pr["id"], prio(pr["priority"]), pr["status"], pr["title"]))
+        print("TL;DR:   %s" % (pr.get("tldr") or "(missing: mb pr tldr %d \"...\")" % pr["id"]))
+        if pr["url"]:
+            print("url:     %s" % pr["url"])
+        if pr["branch"]:
+            print("branch:  %s%s" % (pr["branch"], (" -> " + pr["base"]) if pr["base"] else ""))
+        print("tags:    %s" % (", ".join(pr["tags"]) or "-"))
+        if b:
+            print("bundle:  #%d %s (%s, %d/%d merged; order %s)" % (b["id"], b["title"], b["status"], b["merged_count"], b["pr_count"],
+                                                                   " -> ".join("#%d" % i for i in b["merge_order"]) or "-"))
+        print("author:  %s   created %s   updated %s   %d comment%s" % (pr["author"], rel(pr["created"]), rel(pr["updated"]),
+                                                                        pr["comments"], "" if pr["comments"] == 1 else "s"))
+        print("reviews: %s" % pr["review_state"] + ("" if not pr["reviews"] else ""))
+        for rv in pr["reviews"]:
+            print("    %s %-10s %-20s %s%s" % ({"approved": "✅", "changes": "🔁", "rejected": "⛔"}[rv["verdict"]], rv["verdict"],
+                                             rv["reviewer"], rel(rv["ts"]), "  (stale: predates the latest re-review request)" if rv["stale"] else "")
+                  + (("\n        " + rv["note"].replace("\n", "\n        ")) if rv["note"] else ""))
+        if d.get("not_yet_reviewed"):
+            print("    not yet reviewed by: %s" % ", ".join(d["not_yet_reviewed"][:12]))
+        if pr["body"]:
+            print("body:\n    " + pr["body"].replace("\n", "\n    "))
+        print_thread(d["replies"], d["root"], "comment with: mb pr comment %d \"...\"" % pid)
+        return 0
+    me = resolve_user(args)
+    if a == "comment":
+        args.text = rest
+        text = read_text(args)
+        m = api(args, "POST", "/api/prs/%d/comment" % pid, body={"user": me, "text": text})
+        print("commented [#%d] on PR #%d" % (m["id"], pid))
+        return 0
+    if a == "tldr":
+        text = " ".join(rest) or args.tldr or ""
+        if not text:
+            die("usage: mb pr tldr <id> \"what it does and why, in 1-3 plain sentences\"")
+        pr = api(args, "POST", "/api/prs/%d" % pid, body={"user": me, "tldr": text})
+        print("PR #%d TL;DR: %s" % (pid, pr["tldr"]))
+        return 0
+    if a == "wait":
+        d = api(args, "GET", "/api/prs/%d" % pid)
+        if not d["root"]:
+            die("PR #%d has no discussion thread yet" % pid)
+        return pr_wait(args, d["root"]["id"], "waiting for comments on PR #%d" % pid)
+    if a in ("approve", "changes", "reject"):
+        verdict = {"approve": "approved", "changes": "changes", "reject": "rejected"}[a]
+        note = " ".join(rest)
+        if a in ("changes", "reject") and not note:
+            die("mb pr %s <id> \"note\": say what must change / why (you already commented the specifics on GitHub)" % a)
+        pr = api(args, "POST", "/api/prs/%d/review" % pid, body={"user": me, "verdict": verdict, "note": note})
+        print("PR #%d: %s by %s -> %s" % (pid, verdict, me, fmt_review_state(pr)))
+        return 0
+    if a == "rereview":
+        pr = api(args, "POST", "/api/prs/%d/rereview" % pid, body={"user": me, "note": " ".join(rest)})
+        print("PR #%d: re-review requested; earlier verdicts are stale -> %s" % (pid, fmt_review_state(pr)))
+        return 0
+    if a == "reviews":
+        d = api(args, "GET", "/api/prs/%d/reviews" % pid)
+        print("PR #%d review state: %s" % (pid, d["review_state"]))
+        for rv in d["reviews"]:
+            print("  %s %-10s %-20s %s%s" % ({"approved": "✅", "changes": "🔁", "rejected": "⛔"}[rv["verdict"]], rv["verdict"], rv["reviewer"], rel(rv["ts"]), "  (stale)" if rv["stale"] else "")
+                  + (("\n      " + rv["note"].replace("\n", "\n      ")) if rv["note"] else ""))
+        if not d["reviews"]:
+            print("  (no reviews yet)")
+        if d["not_yet"]:
+            print("  not yet reviewed by: %s" % ", ".join(d["not_yet"][:12]))
+        return 0
+    if a in ("open", "draft", "merged", "closed", "close", "reopen"):
+        status = {"close": "closed", "reopen": "open"}.get(a, a)
+        pr = api(args, "POST", "/api/prs/%d" % pid, body={"user": me, "status": status})
+        print("PR #%d is now %s" % (pid, pr["status"]) + ((": bundle #%d" % pr["bundle_id"]) if pr.get("bundle_id") else ""))
+        return 0
+    if a == "tag":
+        add, remove = split_tag_ops(rest)
+        pr = api(args, "POST", "/api/prs/%d" % pid, body={"user": me, "add_tags": add, "remove_tags": remove})
+        print("PR #%d tags: %s" % (pid, ", ".join(pr["tags"]) or "-"))
+        return 0
+    if a == "priority":
+        if not rest:
+            die("usage: mb pr priority <id> <1-100>   (1 = merge first, 50 = normal, 100 = whenever; P0..P3 = 1/10/50/90)")
+        pr = api(args, "POST", "/api/prs/%d" % pid, body={"user": me, "priority": rest[0]})
+        print("PR #%d priority %s" % (pid, prio(pr["priority"])))
+        return 0
+    if a == "bundle":
+        if not rest:
+            die("usage: mb pr bundle <id> <bundle-id|\"bundle title\"|none>")
+        ref = " ".join(rest)
+        pr = api(args, "POST", "/api/prs/%d" % pid, body={"user": me, "bundle": None if ref.lower() == "none" else ref})
+        print("PR #%d bundle: %s" % (pid, ("#%d %s" % (pr["bundle_id"], pr["bundle_title"])) if pr.get("bundle_id") else "none"))
+        return 0
+    if a == "edit":
+        body = {"user": me}
+        for f, attr in (("title", "title"), ("url", "pr_url"), ("body", "body"), ("tldr", "tldr"), ("branch", "branch"), ("base", "base")):
+            v = getattr(args, attr, None)
+            if v is not None:
+                body[f] = v
+        if args.file:
+            with open(args.file) as f:
+                body["body"] = f.read()
+        if len(body) == 1:
+            die("nothing to change: use --title/--pr-url/--body/--file/--branch/--base")
+        pr = api(args, "POST", "/api/prs/%d" % pid, body=body)
+        print("updated " + fmt_pr(pr, show_url=False))
+        return 0
+    die("unknown pr action %r" % a)
+
+
+def cmd_bundle(args):
+    a = args.action
+    rest = list(args.rest)
+    project = resolve_project(args)
+    if a == "add":
+        me = resolve_user(args)
+        title = " ".join(rest)
+        if not title:
+            die("usage: mb bundle add \"title\" [--prs 3,4,5] [--priority 1-100] [--tags a,b] [--body ...]")
+        body = args.body or ""
+        if args.file:
+            with open(args.file) as f:
+                body = f.read()
+        prs = [x for x in (args.prs or "").replace(",", " ").split() if x]
+        b = api(args, "POST", "/api/bundles", body={"user": me, "project": project or DEFAULT_PROJECT, "title": title,
+                                                      "body": body, "priority": args.priority, "tags": args.tags, "prs": prs})
+        print("created bundle " + fmt_bundle(b))
+        print("add PRs: mb pr add <url> \"title\" --bundle %d   or   mb bundle add-pr %d <pr-id>" % (b["id"], b["id"]))
+        return 0
+    if a == "list":
+        rows = api(args, "GET", "/api/bundles", {"project": None if args.all_projects else project, "status": args.status or "active"})
+        if not rows:
+            print("no bundles (status %s)" % (args.status or "active"))
+        for b in rows:
+            print(fmt_bundle(b))
+        return 0
+    if not rest or not rest[0].lstrip("#").isdigit():
+        die("usage: mb bundle %s <id> ..." % a)
+    bid = int(rest.pop(0).lstrip("#"))
+    if a == "show":
+        d = api(args, "GET", "/api/bundles/%d" % bid)
+        b = d["bundle"]
+        print("Bundle #%d  %s  %s   %s   (%d/%d merged)" % (b["id"], prio(b["priority"]), b["status"], b["title"], b["merged_count"], b["pr_count"]))
+        print("tags:    %s" % (", ".join(b["tags"]) or "-"))
+        print("by:      %s   created %s   updated %s" % (b["created_by"], rel(b["created"]), rel(b["updated"])))
+        if b["body"]:
+            print("body:\n    " + b["body"].replace("\n", "\n    "))
+        print("PRs in merge order:")
+        for pr in d["prs"]:
+            print("  " + fmt_pr(pr, show_url=True).replace("\n", "\n  "))
+        if not d["prs"]:
+            print("  (none yet)")
+        print_thread(d["replies"], d["root"], "comment with: mb bundle comment %d \"...\"" % bid)
+        return 0
+    me = resolve_user(args)
+    if a == "comment":
+        args.text = rest
+        text = read_text(args)
+        m = api(args, "POST", "/api/bundles/%d/comment" % bid, body={"user": me, "text": text})
+        print("commented [#%d] on bundle #%d" % (m["id"], bid))
+        return 0
+    if a == "wait":
+        d = api(args, "GET", "/api/bundles/%d" % bid)
+        return pr_wait(args, d["root"]["id"], "waiting for comments on bundle #%d" % bid)
+    if a in ("add-pr", "remove-pr"):
+        ids = [x.lstrip("#") for x in " ".join(rest).replace(",", " ").split()]
+        if not ids:
+            die("usage: mb bundle %s <bundle-id> <pr-id> [pr-id ...]" % a)
+        b = api(args, "POST", "/api/bundles/%d" % bid, body={"user": me, ("add_prs" if a == "add-pr" else "remove_prs"): ids})
+        print("bundle #%d now has %d PR%s: %s" % (bid, b["pr_count"], "" if b["pr_count"] == 1 else "s", " -> ".join("#%d" % i for i in b["merge_order"]) or "-"))
+        return 0
+    if a == "order":
+        ids = [x.lstrip("#") for x in " ".join(rest).replace(",", " ").replace("->", " ").split()]
+        b = api(args, "POST", "/api/bundles/%d" % bid, body={"user": me, "order": ids})
+        print("bundle #%d merge order: %s" % (bid, " -> ".join("#%d" % i for i in b["merge_order"])))
+        return 0
+    if a in ("open", "merged", "closed", "close", "reopen"):
+        status = {"close": "closed", "reopen": "open"}.get(a, a)
+        b = api(args, "POST", "/api/bundles/%d" % bid, body={"user": me, "status": status})
+        print("bundle #%d is now %s" % (bid, b["status"]))
+        return 0
+    if a == "tag":
+        add, remove = split_tag_ops(rest)
+        b = api(args, "POST", "/api/bundles/%d" % bid, body={"user": me, "add_tags": add, "remove_tags": remove})
+        print("bundle #%d tags: %s" % (bid, ", ".join(b["tags"]) or "-"))
+        return 0
+    if a == "priority":
+        if not rest:
+            die("usage: mb bundle priority <id> <1-100>   (1 = merge first; P0..P3 = 1/10/50/90)")
+        b = api(args, "POST", "/api/bundles/%d" % bid, body={"user": me, "priority": rest[0]})
+        print("bundle #%d priority %s" % (bid, prio(b["priority"])))
+        return 0
+    if a == "edit":
+        body = {"user": me}
+        for f in ("title", "body"):
+            v = getattr(args, f, None)
+            if v is not None:
+                body[f] = v
+        if args.file:
+            with open(args.file) as f:
+                body["body"] = f.read()
+        if len(body) == 1:
+            die("nothing to change: use --title/--body/--file")
+        b = api(args, "POST", "/api/bundles/%d" % bid, body=body)
+        print("updated " + fmt_bundle(b))
+        return 0
+    die("unknown bundle action %r" % a)
+
+
+# ----------------------------------------------------------------- search / pins / pastes
+
+def cmd_search(args):
+    rows = api(args, "GET", "/api/search", {"q": " ".join(args.query), "project": None if args.everywhere else (args.project or resolve_project(args)),
+                                             "channel": resolve_channel(args, args.channel, must_exist=True) if args.channel else None,
+                                             "limit": args.limit})
+    if not rows:
+        print("no matches")
+    for r in rows:
+        print("[#%d] %s %s <%s> %s" % (r["id"], fmt_ts(r["ts"]), r["channel"], r["user"], (r.get("snippet") or r["text"]).replace("\n", " ")))
+    return 0
+
+
+def cmd_pin(args, pinned=True):
+    me = resolve_user(args)
+    m = api(args, "POST", "/api/messages/%d/%s" % (args.id, "pin" if pinned else "unpin"), body={"user": me})
+    print("%s [#%d] in %s" % ("pinned" if pinned else "unpinned", m["id"], m["channel"]))
+    return 0
+
+
+def cmd_unpin(args):
+    return cmd_pin(args, pinned=False)
+
+
+def cmd_pins(args):
+    channel = resolve_channel(args, args.channel, must_exist=True) if args.channel else None
+    rows = api(args, "GET", "/api/pins", {"channel": channel, "project": None if channel else (args.project or resolve_project(args))})
+    if not rows:
+        print("nothing pinned")
+    emit(rows, args, show_channel=True)
+    return 0
+
+
+def cmd_paste(args):
+    me = resolve_user(args)
+    if args.path == "-":
+        content, name = sys.stdin.read(), args.name or "paste.txt"
+    else:
+        with open(args.path, errors="replace") as f:
+            content = f.read()
+        name = args.name or os.path.basename(args.path)
+    channel = resolve_channel(args, args.channel) if args.channel else ""
+    p = api(args, "POST", "/api/pastes", body={"user": me, "name": name, "content": content, "channel": channel,
+                                               "text": args.message or "", "project": resolve_project(args) or ""})
+    print("paste %s (%s, %d lines): %s" % (p["id"], name, p["lines"], p["url"]))
+    if p.get("message_id"):
+        print("posted as [#%d] in %s" % (p["message_id"], channel))
+    print("fetch it: mb get %s" % p["id"])
+    return 0
+
+
+def cmd_get(args):
+    p = api(args, "GET", "/api/pastes/%s" % args.id)
+    sys.stdout.write(p["content"])
+    if not p["content"].endswith("\n"):
+        sys.stdout.write("\n")
+    return 0
+
+
+# ----------------------------------------------------------------- rm / backup (humans)
+
+def cmd_rm(args):
+    if not args.yes:
+        die("this deletes history permanently; add --yes to confirm (channel: mb rm project/channel --yes; project: mb rm project --yes)")
+    if "/" in args.target or args.target.startswith("@"):
+        key = resolve_channel(args, args.target, must_exist=True)
+        ch = api(args, "POST", "/api/channels/%s/delete" % urllib.parse.quote(key, safe=""), body={})
+        print("deleted channel %s (%d messages)" % (ch["key"], ch["deleted_messages"]))
+        return 0
+    projects = {p["name"] for p in api(args, "GET", "/api/projects")}
+    if args.target in projects:
+        p = api(args, "POST", "/api/projects/%s/delete" % args.target, body={})
+        print("deleted project %s (%d channels, %d messages)" % (p["name"], len(p["deleted_channels"]), p["deleted_messages"]))
+        return 0
+    key = resolve_channel(args, args.target, must_exist=True)
+    ch = api(args, "POST", "/api/channels/%s/delete" % urllib.parse.quote(key, safe=""), body={})
+    print("deleted channel %s (%d messages)" % (ch["key"], ch["deleted_messages"]))
+    return 0
+
+
+def cmd_backup(args):
+    r = api(args, "POST", "/api/backup", body={})
+    print("backup written: %s (%d KB)" % (r["path"], r["size"] // 1024))
+    return 0
+
+
+# ----------------------------------------------------------------- skill
+
+SKILL_SRC = os.path.join(HERE, "skill")
+SKILL_DST = os.path.expanduser("~/.claude/skills/msgboard")
+
+
+def cmd_skill(args):
+    if args.action == "show":
+        if os.path.islink(SKILL_DST):
+            print("installed: %s -> %s" % (SKILL_DST, os.readlink(SKILL_DST)))
+        elif os.path.isdir(SKILL_DST):
+            print("installed (copy): %s" % SKILL_DST)
+        else:
+            print("not installed (mb skill install)")
+        return 0
+    if args.action == "install":
+        os.makedirs(os.path.dirname(SKILL_DST), exist_ok=True)
+        if os.path.islink(SKILL_DST) or os.path.isfile(SKILL_DST):
+            os.remove(SKILL_DST)
+        elif os.path.isdir(SKILL_DST):
+            import shutil
+            shutil.rmtree(SKILL_DST)
+        os.symlink(SKILL_SRC, SKILL_DST)
+        print("installed: %s -> %s (tell any session: \"load the msgboard skill\")" % (SKILL_DST, SKILL_SRC))
+        return 0
+    if args.action == "uninstall":
+        if os.path.islink(SKILL_DST):
+            os.remove(SKILL_DST)
+            print("removed %s" % SKILL_DST)
+        else:
+            print("not installed as a link; nothing removed")
+        return 0
+
+
+# ----------------------------------------------------------------- hook
+
+SETTINGS = os.path.expanduser("~/.claude/settings.json")
+HOOK_CMD = "python3 %s" % os.path.join(HERE, "hooks", "unread.py")
+
+
+def cmd_hook(args):
+    try:
+        with open(SETTINGS) as f:
+            settings = json.load(f)
+    except (OSError, ValueError):
+        settings = {}
+    hooks = settings.setdefault("hooks", {})
+    entries = hooks.setdefault("UserPromptSubmit", [])
+    installed = any("msgboard/hooks/unread.py" in h.get("command", "") for e in entries for h in e.get("hooks", []))
+    if args.action == "show":
+        print("hook %s (%s)" % ("installed" if installed else "not installed", SETTINGS))
+        return 0
+    if args.action == "install":
+        if installed:
+            print("already installed")
+            return 0
+        entries.append({"hooks": [{"type": "command", "command": HOOK_CMD, "timeout": 5}]})
+    elif args.action == "uninstall":
+        if not installed:
+            print("not installed")
+            return 0
+        for e in entries:
+            e["hooks"] = [h for h in e.get("hooks", []) if "msgboard/hooks/unread.py" not in h.get("command", "")]
+        hooks["UserPromptSubmit"] = [e for e in entries if e.get("hooks")]
+        if not hooks["UserPromptSubmit"]:
+            del hooks["UserPromptSubmit"]
+    else:
+        die("usage: mb hook install | uninstall | show")
+    if os.path.exists(SETTINGS):
+        with open(SETTINGS) as f:
+            backup = f.read()
+        with open(SETTINGS + ".bak-msgboard", "w") as f:
+            f.write(backup)
+    with open(SETTINGS, "w") as f:
+        json.dump(settings, f, indent=2)
+        f.write("\n")
+    print("%s UserPromptSubmit hook in %s (backup: %s.bak-msgboard)"
+          % ("installed" if args.action == "install" else "removed", SETTINGS, SETTINGS))
+    print("every Claude Code session on this machine now gets a one-line msgboard inbox summary per prompt"
+          if args.action == "install" else "")
+    return 0
+
+
+# ----------------------------------------------------------------- links (remote machines) + launchd services
+
+LINKS_FILE = os.path.join(DATA_DIR, "links.json")
+LINKS_STATE = os.path.join(DATA_DIR, "links-state.json")
+LAUNCH_DIR = os.path.expanduser("~/Library/LaunchAgents")
+SERVICES = {"server": ("com.msgboard.server", "server.py"), "links": ("com.msgboard.links", "link.py")}
+LAUNCH_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+
+def load_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def save_json(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = "%s.%d.tmp" % (path, os.getpid())
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=1)
+    os.replace(tmp, path)
+
+
+def ssh_run(host, remote_cmd, stdin_data=None, timeout=120):
+    cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=30", "-o", "LogLevel=ERROR", host, remote_cmd]
+    return subprocess.run(cmd, input=stdin_data, capture_output=True, timeout=timeout)
+
+
+def deploy_link(host, socket_path):
+    """Copy mb + AGENTS.md + config.json to the remote machine in one ssh session."""
+    import io
+    import tarfile
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        tar.add(os.path.join(HERE, "mb"), arcname="mb")
+        tar.add(os.path.join(HERE, "AGENTS.md"), arcname="AGENTS.md")
+        if os.path.exists(os.path.join(HERE, "skill", "SKILL.md")):
+            tar.add(os.path.join(HERE, "skill", "SKILL.md"), arcname="SKILL.md")
+        cfg = json.dumps({"url": "unix://" + socket_path, "remote": host, "reconnect_secs": 900}, indent=1).encode()
+        ti = tarfile.TarInfo("config.json.new")  # merged into the remote config so keys set there (user, project) survive
+        ti.size = len(cfg)
+        ti.mode = 0o600
+        ti.mtime = int(time.time())
+        tar.addfile(ti, io.BytesIO(cfg))
+    remote = ("set -e; umask 077; mkdir -p ~/.local/bin ~/.msgboard; chmod 700 ~/.msgboard; "
+              "tar -xf - -C ~/.msgboard; mv -f ~/.msgboard/mb ~/.local/bin/mb; chmod 755 ~/.local/bin/mb; "
+              "python3 -c \"import json,os; p=os.path.expanduser('~/.msgboard/config.json'); n=p+'.new'; "
+              "a=json.load(open(p)) if os.path.exists(p) else {}; a.update(json.load(open(n))); "
+              "json.dump(a, open(p,'w'), indent=1); os.remove(n)\"; "
+              "chmod 600 ~/.msgboard/config.json; "
+              "if [ -f ~/.msgboard/SKILL.md ]; then mkdir -p ~/.claude/skills/msgboard && mv -f ~/.msgboard/SKILL.md ~/.claude/skills/msgboard/SKILL.md; fi; "
+              "echo \"deployed: $HOME/.local/bin/mb, $HOME/.msgboard/{config.json,AGENTS.md}, $HOME/.claude/skills/msgboard/SKILL.md\"; "
+              "python3 --version")
+    r = ssh_run(host, remote, stdin_data=buf.getvalue())
+    if r.returncode != 0:
+        die("deploy to %s failed: %s" % (host, r.stderr.decode(errors="replace").strip()[-400:]))
+    print(r.stdout.decode(errors="replace").strip())
+
+
+def service_installed(name):
+    return os.path.exists(os.path.join(LAUNCH_DIR, SERVICES[name][0] + ".plist"))
+
+
+def launchctl(*a, check=False):
+    return subprocess.run(["launchctl"] + list(a), capture_output=True, text=True, check=check)
+
+
+def service_restart(name):
+    if service_installed(name):
+        launchctl("kickstart", "-k", "gui/%d/%s" % (os.getuid(), SERVICES[name][0]))
+        return True
+    return False
+
+
+def cmd_link(args):
+    a = args.action
+    links = load_json(LINKS_FILE, {})
+    if a == "add":
+        if not args.host:
+            die("usage: mb link add <ssh-host> [--socket PATH] [--interval SEC] [--no-deploy]")
+        host = args.host
+        sock = args.socket
+        if not sock:
+            print("resolving the home directory on %s ..." % host, flush=True)
+            r = ssh_run(host, "echo $HOME")
+            if r.returncode != 0:
+                die("cannot ssh to %s: %s" % (host, r.stderr.decode(errors="replace").strip()[-300:]))
+            sock = r.stdout.decode().strip() + "/.msgboard/board.sock"
+        if not args.no_deploy:
+            print("deploying mb to %s ..." % host, flush=True)
+            deploy_link(host, sock)
+        links[host] = {"host": host, "socket": sock, "check_interval": args.interval or 30, "enabled": True,
+                       "added": time.time()}
+        save_json(LINKS_FILE, links)
+        print("link %s -> %s registered" % (host, sock))
+        if service_restart("links"):
+            print("link supervisor restarted (launchd); watch it with: mb link status")
+        else:
+            print("start the supervisor: mb service install   (or by hand: python3 %s/link.py)" % HERE)
+        return 0
+    if a == "remove":
+        if not args.host or args.host not in links:
+            die("usage: mb link remove <host>   (known: %s)" % ", ".join(links) or "none")
+        del links[args.host]
+        save_json(LINKS_FILE, links)
+        print("link %s removed" % args.host)
+        service_restart("links")
+        return 0
+    if a == "deploy":
+        if not args.host or args.host not in links:
+            die("usage: mb link deploy <host>   (add it first with: mb link add <host>)")
+        deploy_link(args.host, links[args.host]["socket"])
+        return 0
+    if a == "check":
+        if not args.host or args.host not in links:
+            die("usage: mb link check <host>")
+        script = ("import socket,sys\np=sys.argv[1]\ns=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);s.settimeout(15);s.connect(p)\n"
+                  "s.sendall(b'GET /api/health HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n');d=b''\n"
+                  "while True:\n c=s.recv(65536)\n if not c: break\n d+=c\nprint(d.split(b'\\r\\n')[0].decode())\n")
+        t0 = time.time()
+        r = ssh_run(args.host, "python3 - %s" % links[args.host]["socket"], stdin_data=script.encode())
+        out = (r.stdout.decode(errors="replace").strip() or r.stderr.decode(errors="replace").strip()[-300:])
+        print("%s: %s (%.1fs, new ssh session)" % (args.host, out, time.time() - t0))
+        return 0 if "200" in out else 1
+    if a == "log":
+        subprocess.run(["tail", "-n", str(args.lines or 40), os.path.join(DATA_DIR, "links.log")])
+        return 0
+    # status
+    st = load_json(LINKS_STATE, {})
+    if not links:
+        print("no links configured (mb link add <ssh-host>)")
+        return 0
+    sup = launchctl("print", "gui/%d/%s" % (os.getuid(), SERVICES["links"][0]))
+    running = "state = running" in sup.stdout
+    print("supervisor: %s" % ("running (launchd)" if running else ("installed but not running" if service_installed("links") else "not installed (mb service install)")))
+    for name, cfg in links.items():
+        L = st.get(name)
+        if not L:
+            print("  %-24s (no state yet)" % name)
+            continue
+        print("  %-24s %-11s for %-8s last ok %-10s restarts %-3s %s"
+              % (name, L["state"], fmt_dur(time.time() - L["since"]),
+                 (fmt_dur(time.time() - L["last_ok"]) + " ago") if L.get("last_ok") else "never",
+                 max(L.get("restarts", 0), 0), ("  " + L["last_error"][:70]) if L.get("last_error") and L["state"] != "up" else ""))
+    return 0
+
+
+def plist_xml(label, script, logfile):
+    return """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>%s</string>
+  <key>ProgramArguments</key><array><string>%s</string><string>%s</string></array>
+  <key>WorkingDirectory</key><string>%s</string>
+  <key>EnvironmentVariables</key><dict><key>PATH</key><string>%s</string><key>HOME</key><string>%s</string></dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>5</integer>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>%s</string>
+  <key>StandardErrorPath</key><string>%s</string>
+</dict></plist>
+""" % (label, sys.executable, os.path.join(HERE, script), HERE, LAUNCH_PATH, os.path.expanduser("~"), logfile, logfile)
+
+
+def cmd_service(args):
+    which = ["server", "links"] if args.which in (None, "all") else [args.which]
+    uid = os.getuid()
+    if args.action == "install":
+        os.makedirs(LAUNCH_DIR, exist_ok=True)
+        for name in which:
+            label, script = SERVICES[name]
+            plist = os.path.join(LAUNCH_DIR, label + ".plist")
+            if name == "server":
+                h = health(args)
+                if h and h.get("pid"):
+                    print("stopping the hand-started server (pid %s) so launchd can own it" % h["pid"])
+                    try:
+                        os.kill(int(h["pid"]), signal.SIGTERM)
+                    except OSError:
+                        pass
+                    for _ in range(50):
+                        time.sleep(0.1)
+                        if not health(args):
+                            break
+            with open(plist, "w") as f:
+                f.write(plist_xml(label, script, os.path.join(DATA_DIR, "%s.launchd.log" % name)))
+            launchctl("bootout", "gui/%d/%s" % (uid, label))
+            r = launchctl("bootstrap", "gui/%d" % uid, plist)
+            if r.returncode != 0:
+                die("launchctl bootstrap failed for %s: %s" % (label, (r.stderr or r.stdout).strip()))
+            print("installed %s (%s)" % (label, plist))
+        if "server" in which:
+            for _ in range(80):
+                time.sleep(0.1)
+                if health(args):
+                    print("server is up under launchd at %s" % base_url(args))
+                    break
+            else:
+                print("server did not answer within 8s; see %s" % os.path.join(DATA_DIR, "server.launchd.log"))
+        return 0
+    if args.action == "uninstall":
+        for name in which:
+            label, _ = SERVICES[name]
+            launchctl("bootout", "gui/%d/%s" % (uid, label))
+            plist = os.path.join(LAUNCH_DIR, label + ".plist")
+            if os.path.exists(plist):
+                os.remove(plist)
+            print("removed %s" % label)
+        return 0
+    if args.action == "restart":
+        for name in which:
+            print("%s: %s" % (name, "restarted" if service_restart(name) else "not installed"))
+        return 0
+    for name in which:
+        label, _ = SERVICES[name]
+        r = launchctl("print", "gui/%d/%s" % (uid, label))
+        if r.returncode != 0:
+            print("%-7s %s: %s" % (name, label, "not installed" if not service_installed(name) else "not loaded"))
+            continue
+        st = next((l.strip() for l in r.stdout.splitlines() if l.strip().startswith("state =")), "state = ?")
+        pid = next((l.strip() for l in r.stdout.splitlines() if l.strip().startswith("pid =")), "")
+        print("%-7s %s: %s %s" % (name, label, st, pid))
+    return 0
+
+
+# ----------------------------------------------------------------- argparse
+
+EPILOG = """\
+quick start (agents):
+  mb join rl-env-dev -p rl-env            register, bind this session, default project rl-env (created if missing)
+  mb status "refactoring the loader"      tell others what you are working on
+  mb read general                         last 50 top-level messages (--unread, --all, --threads)
+  mb send general "deploy done"           post (multi-line: mb send general - <<'EOF' ... EOF)
+  mb ask @bob "is the loader thread-safe?"   question in a DM (or -c dev); mb wait --reply-to <id> blocks for the answer
+  mb answer 42 "yes, since #30"           reply that marks question #42 answered
+  mb claude -p rl-env                     start Claude Code with the msgboard channel (events arrive by themselves; nothing to poll)
+  mb dispatch --agent codex -p rl-env --as codex-1 [--kickoff "..."]   keep a Codex (or claude -p) agent on call: runs only when the board has something for it
+  (claude / codex / dispatch bypass permissions and sandboxes by default; add --safe to keep prompts)
+  mb wait --feed                          block (no timeout) until something for you arrives: run it in the background
+  mb wait general                         block until someone else posts in a channel
+  mb inbox | mb tasks | mb search "x"     what you owe others | the board | find things
+  mb brief | mb who retries | mb areas    orient yourself | who knows about X | your responsibilities (derived from your work)
+  mb pr add <url> "title" --tldr "plain-words what+why" --tags api --priority 10    register a PR; mb pr comment ID "..."
+
+channels: `name` (resolved in your project, else unique match), `project/name`, or `@user` for a DM.
+identity: --as NAME > $MB_USER > name bound by `mb join`.  project: -p > $MB_PROJECT > bound by join.
+server:   --url URL > $MB_URL > config url > http://127.0.0.1:8765    token: --token > $MB_TOKEN > config
+config:   ~/.msgboard/config.json on remote machines (url unix://..., remote, reconnect_secs); data/ next to mb otherwise
+remote:   mb link add <ssh-host>  +  mb service install   (supervised reverse tunnel, launchd, survives reboot)
+"""
+
+
+def build_parser():
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--as", dest="as_", metavar="NAME", default=argparse.SUPPRESS, help="act as this user")
+    common.add_argument("--url", default=argparse.SUPPRESS, help="server base URL")
+    common.add_argument("--token", default=argparse.SUPPRESS, help="server token (if the server requires one)")
+    common.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="machine-readable output (JSONL)")
+    proj = argparse.ArgumentParser(add_help=False)
+    proj.add_argument("-p", "--project", metavar="PROJECT", help="project (default: the one bound by mb join)")
+
+    p = argparse.ArgumentParser(prog="mb", description="msgboard CLI: a local message board for people and agents.",
+                                epilog=EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter, parents=[common])
+    sub = p.add_subparsers(dest="cmd", metavar="COMMAND")
+
+    def add(name, fn, help_, parents=(common,), **kw):
+        s = sub.add_parser(name, parents=list(parents), help=help_, **kw)
+        s.set_defaults(fn=fn)
+        return s
+
+    s = add("serve", cmd_serve, "start the server (foreground; -d for background)")
+    s.add_argument("-d", "--daemon", action="store_true", help="run in the background, log to data/server.log")
+    s.add_argument("--host")
+    s.add_argument("--port", type=int)
+    add("stop", cmd_stop, "stop the background server")
+    s = add("status", cmd_status, "no text: server health + your identity; with text: set what you're working on")
+    s.add_argument("text", nargs="*")
+    s.add_argument("--clear", action="store_true")
+    add("url", cmd_url, "print the server / GUI url")
+    add("open", cmd_open, "open the GUI in the browser (macOS)")
+
+    s = add("join", cmd_join, "register a user name (and emoji, status, project) and bind it to this session", parents=(common, proj))
+    s.add_argument("name", nargs="?", help="your name (default: <folder>-<session suffix>)")
+    s.add_argument("--emoji", help="your icon (default: auto-picked)")
+    s.add_argument("--status", help="what you are working on")
+    s.add_argument("--human", action="store_true", help="mark this user as a human (gets desktop notifications)")
+    add("whoami", cmd_whoami, "print the identity (and project) in use")
+    s = add("emoji", cmd_emoji, "change your emoji")
+    s.add_argument("emoji")
+    add("users", cmd_users, "directory: who is around and what they work on", parents=(common, proj))
+
+    add("projects", cmd_projects, "list projects")
+    s = add("project", cmd_project, "project: show current | use NAME | create NAME | show NAME")
+    s.add_argument("action", nargs="?", choices=["use", "create", "show"])
+    s.add_argument("name", nargs="?")
+    s.add_argument("--title")
+    s.add_argument("--desc")
+    add("channels", cmd_channels, "list channels (grouped by project)", parents=(common, proj))
+    s = add("create", cmd_create, "create a channel", parents=(common, proj))
+    s.add_argument("channel", help="name or project/name")
+    s.add_argument("--topic", default="")
+    s = add("topic", cmd_topic, "set a channel topic", parents=(common, proj))
+    s.add_argument("channel")
+    s.add_argument("text", nargs="+")
+
+    s = add("read", cmd_read, "read channel history (marks it read for you)", parents=(common, proj))
+    s.add_argument("channel", help="name, project/name, or @user (DM)")
+    s.add_argument("-n", "--limit", type=int, default=50, help="last N messages (default 50)")
+    s.add_argument("--since", type=int, metavar="ID", help="messages after this id (includes thread replies)")
+    s.add_argument("--before", type=int, metavar="ID", help="messages before this id (paging back)")
+    s.add_argument("--all", action="store_true", help="whole history")
+    s.add_argument("--unread", action="store_true", help="only messages after your read cursor")
+    s.add_argument("--threads", action="store_true", help="include thread replies inline")
+    s.add_argument("--peek", action="store_true", help="don't advance your read cursor")
+    s = add("send", cmd_send, "post a message (channel is created if missing)", parents=(common, proj))
+    s.add_argument("channel")
+    s.add_argument("text", nargs="*", help="message text; `-` reads stdin")
+    s.add_argument("--file", help="read the message from a file")
+    s = add("reply", cmd_reply, "reply in a thread")
+    s.add_argument("id", type=int, help="message id (root or any reply in the thread)")
+    s.add_argument("text", nargs="*")
+    s.add_argument("--file")
+    s = add("thread", cmd_thread, "show a thread (root + replies)")
+    s.add_argument("id", type=int)
+    s = add("ask", cmd_ask, "ask a question: mb ask @bob \"...\" (DM) or mb ask -c dev @bob \"...\"", parents=(common, proj))
+    s.add_argument("-c", "--channel", help="channel to ask in (default: DM with the one @user, else <project>/general)")
+    s.add_argument("words", nargs="*", help="@targets and the question text")
+    s.add_argument("--file")
+    s = add("answer", cmd_answer, "answer a question (reply + mark it answered)")
+    s.add_argument("id", type=int, help="the question's message id")
+    s.add_argument("text", nargs="*")
+    s.add_argument("--file")
+    s = add("asks", cmd_asks, "open questions for you / by you", parents=(common, proj))
+    s.add_argument("--all", action="store_true", help="include answered")
+    s.add_argument("--everyone", action="store_true", help="all open questions, not just yours")
+    s = add("dm", cmd_dm, "direct message a user")
+    s.add_argument("user")
+    s.add_argument("text", nargs="*")
+    s.add_argument("--file")
+    s = add("unread", cmd_unread, "unread counts per channel")
+    s.add_argument("--all", action="store_true", help="include channels with nothing unread")
+    s = add("inbox", cmd_inbox, "what you owe others: mentions, thread replies, DMs, open questions, your tasks")
+    s.add_argument("--brief", action="store_true", help="one line (used by the Claude Code hook)")
+
+    for name, fn, hlp in (("wait", cmd_wait, "block until someone else posts, print it, exit (124 on timeout)"),
+                          ("follow", cmd_follow, "like wait, but keep streaming forever (one line per message)")):
+        s = add(name, fn, hlp, parents=(common, proj))
+        s.add_argument("channel", nargs="?", help="channel to watch (default: every channel, or -p PROJECT)")
+        s.add_argument("--feed", action="store_true", help="your feed: mentions, DMs, replies in your threads, subscribed channels (recommended)")
+        s.add_argument("--mention", action="store_true", help="only messages that @mention you (or @all)")
+        s.add_argument("--reply-to", type=int, metavar="ID", help="only replies in this thread (e.g. the answer to your question)")
+        s.add_argument("--no-threads", action="store_true", help="ignore thread replies")
+        s.add_argument("--since", type=int, metavar="ID", help="start after this message id instead of your cursor")
+        s.add_argument("--peek", action="store_true", help="watch from now without moving your read cursor")
+        s.add_argument("--all", action="store_true", help=argparse.SUPPRESS)
+        if name == "wait":
+            s.add_argument("--timeout", type=float, metavar="SEC", help="give up after SEC seconds (exit 124)")
+        s.add_argument("-q", "--quiet", action="store_true", help="no status line on stderr")
+
+    s = add("task", cmd_task, "tasks: add \"title\" | take ID | drop ID | done ID | reopen ID | show ID | edit ID [title]", parents=(common, proj))
+    s.add_argument("action", choices=["add", "take", "drop", "done", "reopen", "show", "edit"])
+    s.add_argument("rest", nargs="*")
+    s.add_argument("--body", help="task details")
+    s.add_argument("--tags", help="comma-separated areas this task touches (feeds the owner's areas)")
+    s.add_argument("-c", "--channel", help="channel for the task's system messages (default: <project>/general)")
+    s.add_argument("--take", action="store_true", help="add and take it (a claim)")
+    s = add("tasks", cmd_tasks, "task board (your project by default)", parents=(common, proj))
+    s.add_argument("--all", action="store_true", help="every project, every status")
+    s.add_argument("--mine", action="store_true", help="only tasks you hold")
+    s.add_argument("--done", action="store_true", help="include finished tasks")
+
+    s = add("pr", cmd_pr, "pull requests: add <url> \"title\" --tldr \"...\" | list | show ID | tldr ID \"...\" | comment ID \"...\" | approve|changes|reject ID [\"note\"] | "
+            "rereview ID | reviews ID | tag ID +a -b | priority ID 1-100 | merged|close|reopen|draft ID | bundle ID <bundle> | edit ID | wait ID | sync | tags",
+            parents=(common, proj))
+    s.add_argument("action", choices=["add", "list", "show", "comment", "tag", "priority", "open", "draft", "merged", "closed",
+                                      "close", "reopen", "bundle", "edit", "wait", "sync", "tags",
+                                      "approve", "changes", "reject", "rereview", "reviews", "tldr"])
+    s.add_argument("rest", nargs="*")
+    s.add_argument("--title")
+    s.add_argument("--pr-url", help="the PR link (or give it as the first positional)")
+    s.add_argument("--tldr", help="REQUIRED on add: 1-3 plain sentences, what it does and why (for the human)")
+    s.add_argument("--body", help="description / summary (markdown)")
+    s.add_argument("--file", help="read the description from a file")
+    s.add_argument("--branch")
+    s.add_argument("--base")
+    s.add_argument("--tags", help="comma-separated, e.g. feature,api,needs-review")
+    s.add_argument("--priority", help="1 (merge first) .. 100 (whenever); default 50. Use the whole range so the order is explicit; P0..P3 still accepted (= 1/10/50/90)")
+    s.add_argument("--bundle", help="bundle id or title (created if missing)")
+    s.add_argument("--status", help="add: initial status (open|draft); list: open|draft|merged|closed|active|all")
+    s.add_argument("--tag", help="list: only PRs with this tag")
+    s.add_argument("--review", help="list: pending|approved|changes|rejected")
+    s.add_argument("--no-tldr", action="store_true", help="list: only PRs still missing a TL;DR")
+    s.add_argument("-q", "--query", help="list: text filter")
+    s.add_argument("--mine", action="store_true", help="list: only PRs you registered")
+    s.add_argument("--all-projects", action="store_true")
+    s.add_argument("--timeout", type=float, metavar="SEC", help="wait: give up after SEC seconds")
+    s = add("bundle", cmd_bundle, "PR bundles (merge together): add \"title\" [--prs 3,4] | list | show ID | comment ID | "
+            "add-pr ID PR.. | remove-pr ID PR.. | order ID 3 5 4 | merged|close|reopen ID | tag | priority | edit | wait", parents=(common, proj))
+    s.add_argument("action", choices=["add", "list", "show", "comment", "add-pr", "remove-pr", "order", "open", "merged",
+                                      "closed", "close", "reopen", "tag", "priority", "edit", "wait"])
+    s.add_argument("rest", nargs="*")
+    s.add_argument("--prs", help="add: PR ids to include, e.g. 3,4,5")
+    s.add_argument("--title")
+    s.add_argument("--body")
+    s.add_argument("--file")
+    s.add_argument("--tags")
+    s.add_argument("--priority")
+    s.add_argument("--status", help="list: open|merged|closed|active|all")
+    s.add_argument("--all-projects", action="store_true")
+    s.add_argument("--timeout", type=float, metavar="SEC")
+    s = add("search", cmd_search, "full-text search (your project by default)", parents=(common, proj))
+    s.add_argument("query", nargs="+")
+    s.add_argument("-c", "--channel")
+    s.add_argument("-n", "--limit", type=int, default=20)
+    s.add_argument("--everywhere", action="store_true", help="all projects")
+    s = add("pin", cmd_pin, "pin a message")
+    s.add_argument("id", type=int)
+    s = add("unpin", cmd_unpin, "unpin a message")
+    s.add_argument("id", type=int)
+    s = add("pins", cmd_pins, "pinned messages (channel, or whole project)", parents=(common, proj))
+    s.add_argument("channel", nargs="?")
+    s = add("paste", cmd_paste, "share a file or stdin as a paste (link posted to a channel with -c)", parents=(common, proj))
+    s.add_argument("path", help="file path, or - for stdin")
+    s.add_argument("-c", "--channel", help="post a link in this channel")
+    s.add_argument("-m", "--message", help="text to post with the link")
+    s.add_argument("--name", help="display name (default: file name)")
+    s = add("get", cmd_get, "print a paste's content")
+    s.add_argument("id")
+    s = add("hook", cmd_hook, "Claude Code hook: install | uninstall | show (inbox summary on every prompt)")
+    s.add_argument("action", choices=["install", "uninstall", "show"])
+    s = add("skill", cmd_skill, "Claude Code skill 'msgboard': install | uninstall | show (so sessions can load it)")
+    s.add_argument("action", nargs="?", default="show", choices=["install", "uninstall", "show"])
+    s = add("rm", cmd_rm, "delete a channel (project/name or @user) or a whole project, with its history. Needs --yes", parents=(common, proj))
+    s.add_argument("target")
+    s.add_argument("--yes", action="store_true")
+    add("backup", cmd_backup, "write a consistent copy of the database to data/backups/ (the server also does this daily)")
+    add("brief", cmd_brief, "one-screen orientation: who you are, your areas, channels, questions, PRs, tasks, people", parents=(common, proj))
+    s = add("who", cmd_who, "who knows about a topic (evidence: areas, PRs, reviews, tasks, messages)", parents=(common, proj))
+    s.add_argument("topic", nargs="+")
+    s.add_argument("--everywhere", action="store_true", help="all projects")
+    s = add("areas", cmd_areas, "your areas of responsibility (derived from activity); adjust with +area -area")
+    s.add_argument("ops", nargs="*", help="+area to add, -area to remove")
+    s.add_argument("--of", help="show another user's areas")
+    s = add("profile", cmd_profile, "an agent's profile: areas, PRs, reviews, tasks, activity")
+    s.add_argument("user", nargs="?")
+    s = add("group", cmd_group, "mention groups: add <name> <users...> | remove <name> <users...> | rm <name> | list", parents=(common, proj))
+    s.add_argument("action", nargs="?", default="list", choices=["add", "remove", "rm", "list"])
+    s.add_argument("name", nargs="?")
+    s.add_argument("users", nargs="*")
+    s.add_argument("--all-projects", action="store_true")
+    add("groups", cmd_group, "list mention groups", parents=(common, proj)).set_defaults(action="list", name=None, users=[], all_projects=False)
+    s = add("watch", cmd_watch, "deliver replies of a thread you are not part of")
+    s.add_argument("id", type=int)
+    s = add("mute", cmd_mute, "stop replies of a thread from waking you")
+    s.add_argument("id", type=int)
+    s = add("unwatch", cmd_unwatch, "remove a watch or mute")
+    s.add_argument("id", type=int)
+    s = add("state", cmd_state, "set a channel's one-line state (shown in briefings and the GUI)", parents=(common, proj))
+    s.add_argument("channel")
+    s.add_argument("text", nargs="*")
+    s.add_argument("--clear", action="store_true")
+    s = add("subscribe", cmd_subscribe, "deliver every message of a channel to your feed / channel (not just mentions)", parents=(common, proj))
+    s.add_argument("channel")
+    s = add("unsubscribe", cmd_unsubscribe, "stop delivering a channel to your feed", parents=(common, proj))
+    s.add_argument("channel")
+    add("subscriptions", cmd_subscriptions, "channels delivered to your feed")
+    s = add("feed", cmd_feed, "pending feed items for you (mentions, DMs, replies in your threads, subscribed channels); acknowledges them")
+    s.add_argument("--peek", action="store_true", help="don't acknowledge")
+    s = add("claude", cmd_claude, "start Claude Code with the msgboard channel: board events arrive in the session, zero cost while idle",
+            parents=(common, proj))
+    s.add_argument("--status", help="what you will be working on")
+    s.add_argument("--watch", help="channels to subscribe this session to, comma-separated")
+    s.add_argument("--official", action="store_true", help="use --channels instead of the development-channels flag (if your org allowlists the plugin)")
+    s.add_argument("--no-channel", action="store_true", help="no channel plugin: the session arms `mb wait --feed` itself (automatic on remote machines and Bedrock/Vertex/Foundry)")
+    s.add_argument("--no-watch", action="store_true", help="wait mode: don't subscribe to <project>/general")
+    s.add_argument("--safe", action="store_true", help="keep permission prompts (default passes --dangerously-skip-permissions)")
+    s.add_argument("claude_args", nargs=argparse.REMAINDER, help="extra arguments for claude (after --)")
+    s = add("dispatch", cmd_dispatch, "keep a CLI agent on call: wait on your feed (free while idle), run codex/claude -p/a command with the new items, repeat",
+            parents=(common, proj))
+    s.add_argument("--agent", choices=["codex", "claude", "cmd"], default="codex")
+    s.add_argument("--cwd", help="working directory for the agent (default: current)")
+    s.add_argument("--watch", help="channels to subscribe this agent to, comma-separated")
+    s.add_argument("--status", help="initial status line")
+    s.add_argument("--kickoff", help="run the agent immediately with this instruction (e.g. for a fresh project)")
+    s.add_argument("--guide", action="store_true", help="include ~/msgboard/AGENTS.md in every prompt (bigger prompt, more guidance)")
+    s.add_argument("--once", action="store_true", help="one run, then exit")
+    s.add_argument("--max-runs", type=int)
+    s.add_argument("--no-resume", action="store_true", help="fresh context on every run instead of resuming the agent's session")
+    s.add_argument("--fresh", action="store_true", help="forget the stored session and start a new one")
+    s.add_argument("--run-timeout", type=int, default=3600, help="seconds per run (default 3600)")
+    s.add_argument("--sandbox", choices=["read-only", "workspace-write", "danger-full-access"], help="codex sandbox (default workspace-write)")
+    s.add_argument("--safe", action="store_true", help="keep the agent's sandbox and approval prompts (default: bypass them)")
+    s.add_argument("--approve", action="store_true", help="codex: --approve-for-me (self-approve inside the workspace-write sandbox) instead of full access")
+    s.add_argument("--full-access", action="store_true", help=argparse.SUPPRESS)
+    s.add_argument("--permission-mode", help="claude -p permission mode (default acceptEdits)")
+    s.add_argument("--model", help="model override for the agent")
+    s.add_argument("--cmd", dest="agent_cmd", help="agent=cmd: shell template, {prompt_file} is replaced; the prompt is also on stdin")
+    s.add_argument("-q", "--quiet", action="store_true")
+    s = add("codex", cmd_codex, "start an interactive Codex session with a board identity: board events are queued into it (codex queue). "
+            "`mb codex attach` hooks a Codex that is already running; `mb codex install` adds the board note to ~/.codex/AGENTS.md",
+            parents=(common, proj))
+    s.add_argument("--action", choices=["install", "uninstall", "attach"], default=None,
+                   help=argparse.SUPPRESS)  # written as `mb codex attach|install|uninstall ...`; main() moves the word into this option
+    s.add_argument("--status", help="what you will be working on")
+    s.add_argument("--watch", help="extra channels to subscribe this session to, comma-separated (<project>/general is always on unless --no-watch)")
+    s.add_argument("--no-watch", action="store_true", help="don't subscribe to <project>/general")
+    s.add_argument("--no-push", action="store_true", help="don't queue board events into the session (plain codex with MB_USER set)")
+    s.add_argument("--thread", help="attach: the Codex thread uuid (default: the newest TUI thread)")
+    s.add_argument("--pid", type=int, help="attach: pid of the Codex TUI, the attach ends when it exits (default: the newest codex TUI)")
+    s.add_argument("--since", type=int, help="attach: also deliver feed items after this message id (catch-up)")
+    s.add_argument("--safe", action="store_true", help="keep approvals and the sandbox (default passes --dangerously-bypass-approvals-and-sandbox)")
+    s.add_argument("codex_args", nargs=argparse.REMAINDER, help="extra arguments for codex (after --)")
+    s = add("plugin", cmd_plugin, "the msgboard Claude Code plugin: install | update | uninstall | status")
+    s.add_argument("action", nargs="?", default="status", choices=["install", "update", "uninstall", "status"])
+    s = add("link", cmd_link, "remote machines: add <ssh-host> | remove | status | check | deploy | log  (supervised reverse tunnel)")
+    s.add_argument("action", nargs="?", default="status", choices=["add", "remove", "status", "check", "deploy", "log"])
+    s.add_argument("host", nargs="?")
+    s.add_argument("--socket", help="Unix socket path on the remote machine (default: ~/.msgboard/board.sock there)")
+    s.add_argument("--interval", type=int, help="seconds between end-to-end health checks (default 30)")
+    s.add_argument("--no-deploy", action="store_true", help="don't copy mb/AGENTS.md/config to the remote machine")
+    s.add_argument("-n", "--lines", type=int, help="log: lines to show")
+    s = add("service", cmd_service, "launchd: install | uninstall | status | restart  [server|links|all]  (survive reboot)")
+    s.add_argument("action", nargs="?", default="status", choices=["install", "uninstall", "status", "restart"])
+    s.add_argument("which", nargs="?", choices=["server", "links", "all"])
+    return p
+
+
+def main():
+    if len(sys.argv) > 2 and sys.argv[1] == "codex" and sys.argv[2] in ("install", "uninstall", "attach"):
+        sys.argv[2:3] = ["--action", sys.argv[2]]
+    p = build_parser()
+    argv = sys.argv[1:]
+    if len(argv) >= 2 and argv[0] == "areas":
+        argv = argv[:1] + [("~" + a[1:]) if (a.startswith("-") and not a.startswith("--") and len(a) > 2) else a for a in argv[1:]]
+    if len(argv) >= 3 and argv[0] in ("pr", "bundle") and argv[1] == "tag":
+        # let `mb pr tag 12 +approved -wip` work: a bare -word is a tag removal, not an option
+        argv = argv[:2] + [("~" + a[1:]) if (a.startswith("-") and not a.startswith("--") and len(a) > 2) else a
+                           for a in argv[2:]]
+    args = p.parse_args(argv)
+    if not getattr(args, "cmd", None):
+        p.print_help()
+        return 0
+    try:
+        return args.fn(args) or 0
+    except KeyboardInterrupt:
+        return 130
+    except BrokenPipeError:
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

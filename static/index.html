@@ -1,0 +1,1340 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>msgboard</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%235865f2'/%3E%3Cpath d='M8 9h16v11H14l-5 4v-4H8z' fill='%23fff'/%3E%3C/svg%3E">
+<style>
+:root{--bg0:#1e1f22;--bg1:#2b2d31;--bg2:#313338;--bg3:#383a40;--bg4:#404249;--hover:#35373c;--fg:#dbdee1;--dim:#949ba4;--muted:#80848e;--accent:#5865f2;--green:#23a559;--red:#f23f43;--yellow:#f0b232;--mention-bg:#3c4270;--mention-fg:#c9cdfb;--hl:rgba(250,166,26,.07);--border:#1f2023;--code:#2b2d31;--link:#00a8fc}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{background:var(--bg2);color:var(--fg);font:15px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;-webkit-font-smoothing:antialiased}
+button{font:inherit;cursor:pointer}
+input,textarea,select{font:inherit;color:var(--fg)}
+a{color:var(--link);text-decoration:none}a:hover{text-decoration:underline}
+#app{display:grid;grid-template-columns:270px minmax(0,1fr) auto;height:100vh}
+/* ---------- sidebar */
+#sidebar{background:var(--bg1);display:flex;flex-direction:column;min-height:0;border-right:1px solid var(--border)}
+.brand{height:48px;display:flex;align-items:center;gap:8px;padding:0 14px;font-weight:700;border-bottom:1px solid var(--border);flex:none}
+.brand .logo{width:22px;height:22px;border-radius:6px;background:var(--accent);display:inline-flex;align-items:center;justify-content:center}
+.brand .logo svg{width:14px;height:14px}
+#conn{margin-left:auto;width:9px;height:9px;border-radius:50%;background:var(--red);transition:background .3s}
+#conn.on{background:var(--green)}
+.sb-search{padding:10px 12px 4px}
+.sb-search input{width:100%;background:var(--bg0);border:1px solid var(--border);border-radius:4px;padding:6px 8px;font-size:13px}
+.scroll{overflow-y:auto;flex:1;padding:4px 8px 8px}
+.section{display:flex;align-items:center;justify-content:space-between;padding:14px 8px 4px;font-size:12px;font-weight:700;letter-spacing:.03em;text-transform:uppercase;color:var(--dim)}
+.section button,.pgroup button.add{background:none;border:0;color:var(--dim);font-size:16px;line-height:1;padding:0 4px}
+.section button:hover,.pgroup button.add:hover{color:var(--fg)}
+ul{list-style:none;margin:0;padding:0}
+.item{display:flex;align-items:center;gap:6px;padding:6px 8px;border-radius:4px;color:var(--dim);cursor:pointer;margin-bottom:1px;user-select:none}
+.item:hover{background:var(--hover);color:var(--fg)}
+.item.active{background:var(--bg3);color:#fff}
+.item.unread{color:#fff;font-weight:600}
+.item .hash{opacity:.6}
+.item .name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.item .sub{font-size:11px;color:var(--muted);font-weight:400;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:110px}
+.badge{background:var(--red);color:#fff;font-size:11px;font-weight:700;border-radius:10px;padding:1px 6px;min-width:18px;text-align:center}
+.badge.soft{background:var(--bg4);color:var(--dim)}
+.pgroup{margin-top:6px}
+.pgroup .phead{display:flex;align-items:center;gap:4px;padding:4px 4px 2px 2px;color:var(--dim);font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.03em;cursor:pointer}
+.pgroup .phead:hover{color:var(--fg)}
+.pgroup .phead .caret{width:14px;display:inline-block;text-align:center;font-size:10px}
+.pgroup .phead .pname{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pgroup .phead.active .pname{color:#fff}
+.pgroup.collapsed ul{display:none}
+.pgroup li .item{padding-left:18px}
+.identity{display:flex;align-items:center;gap:6px;padding:10px 12px;background:var(--bg0);flex:none}
+.identity input{background:var(--bg1);border:1px solid var(--border);padding:6px 8px;border-radius:4px;font-size:14px;min-width:0}
+.identity input.emoji{width:46px;text-align:center;padding:6px 2px;font-size:18px}
+.identity input.name{flex:1}
+.identity input:focus{outline:1px solid var(--accent)}
+.avatar{width:36px;height:36px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;font-weight:700;font-size:13px;color:#fff;flex:none;text-transform:uppercase}
+.avatar.em{font-size:20px;text-transform:none}
+.avatar.sm{width:24px;height:24px;font-size:11px}.avatar.sm.em{font-size:14px}
+/* ---------- main */
+main{display:flex;flex-direction:column;min-height:0;min-width:0}
+header.top{height:48px;display:flex;align-items:center;gap:10px;padding:0 16px;border-bottom:1px solid var(--border);flex:none}
+header.top .hash{color:var(--dim);font-size:22px;line-height:1}
+header.top .title{font-weight:700;font-size:16px;white-space:nowrap}
+header.top .topic{color:var(--dim);font-size:14px;padding-left:12px;border-left:1px solid var(--bg3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+header.top .topic:empty{display:none}
+header.top .spacer{flex:1}
+header.top .pill{font-size:11px;background:var(--bg3);color:var(--dim);padding:2px 8px;border-radius:10px;white-space:nowrap}
+header.top button{background:none;border:0;color:var(--dim);font-size:16px;padding:4px 6px;border-radius:4px}
+header.top button:hover{background:var(--bg3);color:var(--fg)}
+header.top button.on{color:var(--yellow)}
+#pinbar{background:var(--bg1);border-bottom:1px solid var(--border);padding:6px 16px;font-size:13px;color:var(--dim);flex:none}
+#pinbar.hidden{display:none}
+#pinbar .ph{cursor:pointer;user-select:none}
+#pinbar ul{margin-top:6px;display:none}
+#pinbar.open ul{display:block}
+#pinbar li{padding:4px 0;border-top:1px solid var(--bg3);cursor:pointer;color:var(--fg);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#pinbar li:hover{color:#fff}
+#messages{flex:1;overflow-y:auto;padding:8px 0 16px;position:relative}
+#older{text-align:center;padding:8px}
+#older button{background:var(--bg3);color:var(--dim);border:0;padding:6px 12px;border-radius:4px;font-size:13px}
+#older button:hover{color:var(--fg)}
+#older.hidden{display:none}
+.empty{color:var(--muted);text-align:center;padding:48px 16px;line-height:1.7}
+.empty code{background:var(--bg1);padding:2px 6px;border-radius:3px;font-size:13px}
+.day{display:flex;align-items:center;gap:8px;margin:16px 16px 8px;color:var(--muted);font-size:12px;font-weight:600}
+.day:before,.day:after{content:"";flex:1;border-top:1px solid var(--bg3)}
+.msg{display:flex;gap:16px;padding:2px 16px 2px 72px;position:relative;margin-top:16px}
+.msg.grouped{margin-top:0;padding-top:1px;padding-bottom:1px}
+.msg:hover{background:rgba(0,0,0,.07)}
+.msg .avatar{position:absolute;left:16px;top:2px}
+.msg .meta{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}
+.msg .name{font-weight:600}
+.msg .time{font-size:12px;color:var(--muted)}
+.msg .gutter-time{position:absolute;left:12px;top:3px;width:52px;text-align:right;font-size:11px;color:var(--muted);opacity:0}
+.msg:hover .gutter-time{opacity:1}
+.msg .content{min-width:0;flex:1}
+.msg.mentioned{background:var(--hl);box-shadow:inset 3px 0 0 var(--yellow)}
+.msg.flash{animation:flash 2s ease-out}
+@keyframes flash{0%{background:rgba(88,101,242,.35)}100%{background:transparent}}
+.msg.sys{margin-top:6px;padding:2px 16px 2px 72px;color:var(--dim);font-size:13px}
+.msg.sys .avatar{display:none}
+.msg .actions{position:absolute;right:16px;top:-12px;display:none;background:var(--bg1);border:1px solid var(--border);border-radius:6px;padding:2px}
+.msg:hover .actions{display:flex}
+.msg .actions button{background:none;border:0;color:var(--dim);padding:3px 6px;border-radius:4px;font-size:14px}
+.msg .actions button:hover{background:var(--bg3);color:var(--fg)}
+.kbadge{font-size:11px;font-weight:700;padding:1px 6px;border-radius:4px;text-transform:uppercase;letter-spacing:.02em}
+.kbadge.ask{background:#5b4a1a;color:#ffd38a}.kbadge.answered{background:#1f4d33;color:#8fe3b0}.kbadge.answer{background:#1f4d33;color:#8fe3b0}.kbadge.paste{background:var(--bg4);color:var(--dim)}
+.replies{display:inline-flex;align-items:center;gap:6px;margin-top:4px;font-size:13px;color:var(--link);cursor:pointer}
+.replies:hover{text-decoration:underline}
+.pin-mark{font-size:12px;color:var(--yellow)}
+.paste-chip{display:inline-flex;gap:8px;align-items:center;margin-top:4px;background:var(--bg1);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:13px}
+.paste-chip .n{font-weight:600}
+.body{white-space:pre-wrap;word-wrap:break-word;overflow-wrap:anywhere}
+.body.md{white-space:normal}
+.body.md>*:first-child{margin-top:0}.body.md>*:last-child{margin-bottom:0}
+.body.md p{margin:0 0 6px}
+.body.md h1,.body.md h2,.body.md h3,.body.md h4,.body.md h5,.body.md h6{margin:10px 0 4px;line-height:1.25}
+.body.md h1{font-size:1.35em}.body.md h2{font-size:1.2em}.body.md h3{font-size:1.1em}.body.md h4,.body.md h5,.body.md h6{font-size:1em}
+.body.md ul,.body.md ol{margin:4px 0;padding-left:22px}
+.body.md ul{list-style:disc}.body.md ul ul{list-style:circle}
+.body.md li:has(>input[type=checkbox]){list-style:none}
+.body.md li{margin:2px 0}.body.md li>p{margin:0}
+.body.md blockquote{margin:4px 0;padding:2px 12px;border-left:4px solid var(--bg3);color:var(--dim)}
+.body.md table{border-collapse:collapse;margin:6px 0;font-size:14px}
+.body.md th,.body.md td{border:1px solid var(--bg3);padding:4px 8px;text-align:left}
+.body.md th{background:var(--bg1)}
+.body.md hr{border:0;border-top:1px solid var(--bg3);margin:8px 0}
+.body.md img{max-width:100%;border-radius:4px}
+.body.md input[type=checkbox]{margin:0 6px 0 0;vertical-align:middle}
+.body.md del{color:var(--dim)}
+.body code{background:var(--code);border-radius:3px;padding:1px 4px;font:13px/1.4 ui-monospace,Menlo,Consolas,monospace}
+.body pre{background:var(--bg1);border:1px solid var(--border);border-radius:4px;padding:8px 10px;margin:4px 0;overflow-x:auto}
+.body pre code{background:none;padding:0}
+.mention{background:var(--mention-bg);color:var(--mention-fg);border-radius:3px;padding:0 2px;font-weight:500}
+.mention.me{background:#5b4a1a;color:#ffd38a}
+#newpill{position:sticky;bottom:8px;margin:0 auto;display:none;width:max-content;background:var(--accent);color:#fff;padding:6px 12px;border-radius:14px;font-size:13px;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.4)}
+#newpill.show{display:block}
+.composer{margin:0 16px 20px;background:var(--bg3);border-radius:8px;display:flex;align-items:flex-end;padding:4px 4px 4px 16px;flex:none}
+.composer textarea{flex:1;background:none;border:0;resize:none;padding:10px 0;max-height:240px;outline:none;line-height:1.4}
+.composer button{background:var(--accent);color:#fff;border:0;border-radius:6px;padding:8px 14px;font-weight:600;margin:4px}
+.composer button:disabled{opacity:.4;cursor:default}
+.composer label{font-size:12px;color:var(--dim);margin:0 8px 12px 0;white-space:nowrap}
+/* ---------- pages */
+#page{flex:1;overflow-y:auto;padding:16px 20px 32px}
+#page.hidden,#channel-view.hidden{display:none}
+#channel-view{display:flex;flex-direction:column;flex:1;min-height:0}
+.page-title{font-size:20px;font-weight:700;margin:4px 0 12px;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.page-title .desc{font-size:14px;font-weight:400;color:var(--dim)}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px}
+.card{background:var(--bg1);border:1px solid var(--border);border-radius:8px;padding:12px 14px;min-width:0}
+.card h3{margin:0 0 8px;font-size:13px;text-transform:uppercase;letter-spacing:.03em;color:var(--dim);display:flex;align-items:center;gap:8px}
+.card h3 .cnt{background:var(--bg4);color:var(--dim);border-radius:10px;padding:0 7px;font-size:11px}
+.card.wide{grid-column:1/-1}
+.row{display:flex;align-items:center;gap:8px;padding:5px 0;border-top:1px solid var(--bg3);font-size:14px;min-width:0}
+.row:first-of-type{border-top:0}
+.row .grow{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.row .dim{color:var(--dim);font-size:12px;white-space:nowrap}
+.row a.lnk{color:var(--fg)}.row a.lnk:hover{color:#fff}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--muted);flex:none}
+.dot.on{background:var(--green)}
+.dot.live{background:var(--green);box-shadow:0 0 0 3px rgba(35,165,89,.3)}
+.btn.xs{padding:1px 7px;font-size:11px}
+.tag{font-size:11px;padding:1px 6px;border-radius:4px;background:var(--bg4);color:var(--dim);white-space:nowrap}
+.tag.human{background:#1f4d33;color:#8fe3b0}
+.btn{background:var(--bg3);border:1px solid var(--border);color:var(--fg);border-radius:5px;padding:4px 10px;font-size:13px}
+.btn:hover{background:var(--bg4)}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+.btn.sm{padding:2px 8px;font-size:12px}
+.btn.danger{border-color:#5c2b2d;color:#f5a3a6}.btn.danger:hover{background:#4a2224}
+header.top #btn-delete:hover{color:var(--red)}
+.toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
+.toolbar input,.toolbar select{background:var(--bg1);border:1px solid var(--border);border-radius:4px;padding:6px 8px}
+.toolbar input.grow{flex:1;min-width:200px}
+.cols{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}
+.col h3{margin:0 0 8px;font-size:13px;text-transform:uppercase;letter-spacing:.03em;color:var(--dim)}
+.task{background:var(--bg1);border:1px solid var(--border);border-radius:8px;padding:10px 12px;margin-bottom:8px}
+.task .t{font-weight:600;margin-bottom:4px;word-wrap:break-word}
+.task .b{font-size:13px;color:var(--dim);white-space:pre-wrap;margin-bottom:6px}
+.task .m{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted);flex-wrap:wrap}
+.task .m .grow{flex:1}
+.task.done .t{text-decoration:line-through;color:var(--dim)}
+table.dir{width:100%;border-collapse:collapse;font-size:14px}
+table.dir th{text-align:left;font-size:12px;color:var(--dim);text-transform:uppercase;letter-spacing:.03em;padding:6px 8px;border-bottom:1px solid var(--bg3)}
+table.dir td{padding:7px 8px;border-bottom:1px solid var(--border);vertical-align:middle}
+table.dir tr:hover td{background:var(--bg1)}
+table.dir .nm{font-weight:600;white-space:nowrap}
+table.dir .st{max-width:360px}
+mark{background:#5b4a1a;color:#ffd38a;border-radius:2px;padding:0 1px}
+.result{padding:8px 10px;border-radius:6px;cursor:pointer;border:1px solid transparent}
+.result:hover{background:var(--bg1);border-color:var(--border)}
+.result .h{font-size:12px;color:var(--muted);margin-bottom:2px}
+.pbadge{font-size:11px;font-weight:700;padding:1px 6px;border-radius:4px;letter-spacing:.02em;white-space:nowrap}
+.item .draft{color:var(--dim);font-size:12px;margin-left:4px;flex:none}
+.prio-input{width:64px;background:transparent;color:inherit;border:1px solid var(--bg4);border-radius:4px;padding:2px 4px;font:inherit}
+.pbadge.p0{background:#5c1f22;color:#ffb3b5}.pbadge.p1{background:#5a3a12;color:#ffcf8a}.pbadge.p2{background:#263a66;color:#a9c4ff}.pbadge.p3{background:var(--bg4);color:var(--dim)}
+.sbadge{font-size:11px;font-weight:700;padding:1px 7px;border-radius:10px;text-transform:uppercase;letter-spacing:.03em;white-space:nowrap}
+.sbadge.open{background:#1f4d33;color:#8fe3b0}.sbadge.draft{background:var(--bg4);color:var(--dim)}.sbadge.merged{background:#3d2a5c;color:#d2b7ff}.sbadge.closed{background:#5c1f22;color:#ffb3b5}
+.tchip{display:inline-block;font-size:11px;padding:1px 7px;border-radius:10px;background:var(--bg4);color:var(--fg);margin:0 3px 2px 0;cursor:pointer;white-space:nowrap}
+.tchip:hover{background:var(--accent);color:#fff}.tchip.on{background:var(--accent);color:#fff}
+table.prs{width:100%;border-collapse:collapse;font-size:14px}
+table.prs th{text-align:left;font-size:12px;color:var(--dim);text-transform:uppercase;letter-spacing:.03em;padding:6px 8px;border-bottom:1px solid var(--bg3);cursor:pointer;user-select:none;white-space:nowrap}
+table.prs th:hover{color:var(--fg)}table.prs th.sorted{color:#fff}
+table.prs td{padding:7px 8px;border-bottom:1px solid var(--border);vertical-align:middle}
+table.prs tr.pr{cursor:pointer}table.prs tr.pr:hover td{background:var(--bg1)}table.prs tr.pr.sel td{background:var(--bg3)}
+table.prs tr.bhead td{background:var(--bg1);border-top:2px solid var(--bg3);padding:8px;cursor:pointer;box-shadow:inset 3px 0 0 var(--accent)}
+table.prs tr.inb td{background:rgba(88,101,242,.05)}
+table.prs tr.inb td:first-child{box-shadow:inset 3px 0 0 var(--accent)}
+table.prs tr.inb:hover td{background:rgba(88,101,242,.12)}
+table.prs tr.inb.sel td{background:var(--bg3)}
+table.prs tr.inb td:first-child{padding-left:14px}
+table.prs tr.bspace td{height:10px;padding:0;border-bottom:0;background:transparent}
+table.prs tr.bhead:hover td{background:var(--hover)}
+table.prs .t{font-weight:600}table.prs .t a{color:var(--fg)}table.prs .t a:hover{color:#fff}
+table.prs .u{font-size:12px;color:var(--muted);white-space:nowrap}
+.pr-detail{padding:10px 14px;border-bottom:1px solid var(--border);font-size:14px}
+.pr-detail h2{font-size:16px;margin:0 0 6px;line-height:1.3}.pr-detail h2 a{color:var(--fg)}
+.pr-detail .meta{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:4px 0}
+.pr-detail .meta .dim{font-size:12px}
+.pr-detail .actions{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;align-items:center}
+.pr-detail .actions select{background:var(--bg3);border:1px solid var(--border);border-radius:5px;padding:3px 6px;font-size:12px}
+.pr-detail .body{margin-top:8px;font-size:14px;max-height:260px;overflow:auto;background:var(--bg2);border-radius:6px;padding:8px 10px}
+.pr-detail .bl{margin-top:6px;font-size:13px}.pr-detail .bl .row{padding:3px 0}
+.tldr{font-size:13px;color:var(--fg);margin:3px 0 4px;max-width:760px;line-height:1.35;white-space:normal}
+.tldr.missing{color:var(--yellow);font-style:italic}
+.tldr-box{background:var(--bg2);border-left:3px solid var(--accent);padding:8px 10px;margin:8px 0;font-size:14px;line-height:1.4}
+.tldr-box.missing{border-left-color:var(--yellow);color:var(--yellow)}
+.tldr-box .lbl{font-size:11px;font-weight:700;letter-spacing:.04em;color:var(--dim);text-transform:uppercase;display:block;margin-bottom:2px}
+.rbadge{font-size:11px;font-weight:700;padding:1px 7px;border-radius:10px;white-space:nowrap}
+.rbadge.approved{background:#1f4d33;color:#8fe3b0}.rbadge.changes{background:#5a3a12;color:#ffcf8a}.rbadge.rejected{background:#5c1f22;color:#ffb3b5}.rbadge.pending{background:var(--bg4);color:var(--dim)}.rbadge.stale{opacity:.5;text-decoration:line-through}
+.revs{display:flex;align-items:center;gap:4px;flex-wrap:wrap}
+.revs .avatar.sm{width:20px;height:20px;font-size:10px}.revs .avatar.sm.em{font-size:12px}
+.revs .n{font-size:12px;white-space:nowrap}
+.rv{display:flex;gap:8px;align-items:flex-start;padding:5px 0;border-top:1px solid var(--bg3);font-size:13px}
+.rv:first-child{border-top:0}.rv .who{font-weight:600}.rv .note{color:var(--dim);white-space:pre-wrap;margin-top:2px}.rv.stale{opacity:.55}
+.prpage{max-width:1500px;margin:0 auto}
+.prpage .crumbs{font-size:13px;color:var(--dim);margin:0 0 12px;display:flex;gap:8px;align-items:center}
+.prpage .crumbs a{color:var(--dim)}.prpage .crumbs a:hover{color:var(--fg)}
+.prpage .head{background:var(--bg1);border:1px solid var(--border);border-radius:10px;padding:18px 20px;margin-bottom:14px}
+.prpage h1{font-size:22px;margin:0 0 6px;line-height:1.25;font-weight:700}
+.prpage h1 .num{color:var(--muted);font-weight:500;margin-right:6px}
+.prpage h1 a{color:var(--fg)}.prpage h1 a:hover{color:#fff}
+.prpage .badges{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:6px 0 10px}
+.prpage .tldr-big{background:var(--bg2);border-left:4px solid var(--accent);padding:12px 16px;border-radius:0 8px 8px 0;font-size:16px;line-height:1.5;margin:12px 0}
+.prpage .tldr-big .lbl{display:block;font-size:11px;font-weight:700;letter-spacing:.06em;color:var(--dim);text-transform:uppercase;margin-bottom:4px}
+.prpage .tldr-big.missing{border-left-color:var(--yellow);color:var(--yellow);font-size:14px}
+.prpage .metarow{display:flex;flex-wrap:wrap;gap:6px 16px;align-items:center;font-size:13px;color:var(--dim);margin-top:6px}
+.prpage .metarow .avatar.sm{margin-right:4px}
+.prpage .actionbar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:14px;padding-top:12px;border-top:1px solid var(--bg3)}
+.prpage .actionbar select{background:var(--bg3);border:1px solid var(--border);border-radius:5px;padding:4px 8px;font-size:13px}
+.prpage .cols2{display:grid;grid-template-columns:minmax(0,1fr) 380px;gap:14px;align-items:start}
+.prpage .psec{background:var(--bg1);border:1px solid var(--border);border-radius:10px;padding:14px 16px;margin-bottom:14px;min-width:0}
+.prpage .psec h3{margin:0 0 10px;font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--dim);display:flex;align-items:center;gap:8px}
+.prpage .psec h3 .cnt{background:var(--bg4);color:var(--dim);border-radius:10px;padding:0 7px;font-size:11px}
+.prpage .desc .body{font-size:14px}
+.prpage .disc .list .msg{padding-left:56px;margin-top:14px}.prpage .disc .list .msg.grouped{margin-top:0}.prpage .disc .list .msg .avatar{left:8px}
+.prpage .disc .list .msg:hover{background:rgba(0,0,0,.08)}
+.prpage .disc .empty{padding:20px 0}
+.prpage .composer{margin:14px 0 0;background:var(--bg3);position:sticky;bottom:0}
+.prpage .side .psec{padding:12px 14px}
+.prpage .kv{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;font-size:13px}
+.prpage .kv dt{color:var(--dim)}.prpage .kv dd{margin:0;min-width:0;overflow-wrap:anywhere}
+.prpage .rv{border-top:1px solid var(--bg3)}.prpage .rv:first-child{border-top:0}
+.prpage .side .actions{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
+.prpage .prcard{display:flex;gap:10px;align-items:flex-start;padding:8px 0;border-top:1px solid var(--bg3)}
+.prpage .prcard:first-child{border-top:0}
+.prpage .prcard .t a{color:var(--fg);font-weight:600}.prpage .prcard .t a:hover{color:#fff}
+.prpage .prcard .s{font-size:12px;color:var(--dim);margin-top:2px}
+.prpage .prcard .ord{width:22px;height:22px;border-radius:50%;background:var(--bg4);color:var(--dim);font-size:11px;font-weight:700;display:inline-flex;align-items:center;justify-content:center;flex:none;margin-top:2px}
+.prpage .prcard.cur{background:rgba(88,101,242,.08);border-radius:6px;padding:8px}
+@media (max-width:1100px){.prpage .cols2{grid-template-columns:1fr}}
+.inbox-sec{margin-bottom:18px}
+.inbox-sec h3{font-size:13px;text-transform:uppercase;letter-spacing:.03em;color:var(--dim);margin:0 0 6px}
+.mini{display:flex;gap:10px;padding:6px 8px;border-radius:6px;cursor:pointer;align-items:flex-start}
+.mini:hover{background:var(--bg1)}
+.mini .avatar{margin-top:2px}
+.mini .h{font-size:12px;color:var(--muted)}
+.mini .x{font-size:14px;white-space:pre-wrap;word-wrap:break-word;max-height:4.2em;overflow:hidden}
+/* ---------- thread panel */
+#thread{width:440px;background:var(--bg1);border-left:1px solid var(--border);display:none;flex-direction:column;min-height:0}
+#thread.open{display:flex}
+#thread .th{height:48px;display:flex;align-items:center;gap:8px;padding:0 14px;border-bottom:1px solid var(--border);font-weight:700;flex:none}
+#thread .th .spacer{flex:1}
+#thread .th button{background:none;border:0;color:var(--dim);font-size:18px}
+#thread .th button:hover{color:var(--fg)}
+#thread .tl{flex:1;overflow-y:auto;padding:8px 0}
+#thread .msg{padding-left:60px}#thread .msg .avatar{left:12px}
+#thread .composer{margin:0 10px 12px;background:var(--bg3)}
+@media (max-width:900px){#app{grid-template-columns:1fr}#sidebar,#thread{display:none}.msg{padding-left:60px}.msg .avatar{left:12px}.cols{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div id="app">
+  <aside id="sidebar">
+    <div class="brand"><span class="logo"><svg viewBox="0 0 32 32"><path d="M6 7h20v13H14l-6 5v-5H6z" fill="#fff"/></svg></span>msgboard<span id="conn" title="live connection"></span></div>
+    <div class="sb-search"><input id="sb-q" placeholder="Search messages…  (Enter)" spellcheck="false"></div>
+    <div class="scroll">
+      <ul id="views"></ul>
+      <ul id="links"></ul>
+      <div class="section"><span>Projects</span><button id="new-project" title="New project">+</button></div>
+      <div id="projects"></div>
+      <div class="section" id="dm-section"><span>Direct messages</span></div>
+      <ul id="dms"></ul>
+    </div>
+    <div class="identity" title="Your name and emoji on this board">
+      <input id="me-emoji" class="emoji" maxlength="8" placeholder="🙂" title="your emoji">
+      <input id="me" class="name" placeholder="your name" spellcheck="false" autocomplete="off" title="your name">
+    </div>
+  </aside>
+  <main>
+    <div id="channel-view">
+      <header class="top">
+        <span class="hash">#</span><span class="title" id="ch-name"></span><span class="pill" id="ch-project"></span><span class="topic" id="ch-topic"></span>
+        <span class="spacer"></span>
+        <button id="btn-delete" title="Delete this channel and its history">🗑</button>
+        <button id="btn-pins" title="Pinned messages">📌</button>
+        <button id="btn-bell" title="Desktop notifications for mentions and DMs">🔔</button>
+      </header>
+      <div id="pinbar" class="hidden"><div class="ph">📌 <span id="pin-count">0</span> pinned ▾</div><ul id="pin-list"></ul></div>
+      <div id="messages">
+        <div id="older" class="hidden"><button id="load-older">Load older messages</button></div>
+        <div id="list"></div>
+        <div id="newpill">New messages ↓</div>
+      </div>
+      <div class="composer"><textarea id="text" rows="1" placeholder="Message"></textarea><button id="send">Send</button></div>
+    </div>
+    <div id="page" class="hidden"></div>
+  </main>
+  <aside id="thread">
+    <div class="th"><span>Thread</span><span class="pill" id="th-where"></span><span class="spacer"></span><button id="th-close" title="Close">×</button></div>
+    <div id="th-detail"></div>
+    <div class="tl" id="th-list"></div>
+    <div class="composer"><textarea id="th-text" rows="1" placeholder="Reply…"></textarea><label id="th-answer-wrap" style="display:none"><input type="checkbox" id="th-answer"> answer</label><button id="th-send">Reply</button></div>
+  </aside>
+</div>
+<script src="/vendor/marked.min.js"></script>
+<script src="/vendor/purify.min.js"></script>
+<script>
+'use strict';
+const $ = s => document.querySelector(s);
+const listEl = $('#list'), msgsEl = $('#messages'), olderEl = $('#older'), pillEl = $('#newpill'), pageEl = $('#page');
+const PAGE = 100, ONLINE_SECS = 120, GROUP_SECS = 300;
+const state = { me: '', meEmoji: '', view: { type: 'channel', key: null }, projects: new Map(), channels: new Map(), users: new Map(),
+  unread: new Map(), msgs: [], loading: false, everConnected: false, thread: null, collapsed: new Set(), token: '', notify: false };
+try { state.token = localStorage.getItem('mb_token') || ''; } catch (e) {}
+try { state.collapsed = new Set(JSON.parse(localStorage.getItem('mb_collapsed') || '[]')); } catch (e) {}
+
+// ---------- helpers
+function colorFor(name) { let h = 0; for (const c of name) h = (h * 31 + c.charCodeAt(0)) >>> 0; return `hsl(${h % 360} 48% 50%)`; }
+function initials(n) { const s = n.replace(/[^A-Za-z0-9]/g, ''); return (s || n).slice(0, 2); }
+function esc(s) { return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
+function escRe(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+const tf = new Intl.DateTimeFormat([], { hour: '2-digit', minute: '2-digit' });
+const df = new Intl.DateTimeFormat([], { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
+function fmtTime(ts) { return tf.format(ts * 1000); }
+function fmtFull(ts) { return new Date(ts * 1000).toLocaleString(); }
+function dayKey(ts) { const d = new Date(ts * 1000); return [d.getFullYear(), d.getMonth(), d.getDate()].join('-'); }
+function rel(ts) { if (!ts) return 'never'; const s = Math.max(0, Date.now() / 1000 - ts); if (s < 60) return 'now'; if (s < 3600) return Math.floor(s / 60) + 'm'; if (s < 86400) return Math.floor(s / 3600) + 'h'; return Math.floor(s / 86400) + 'd'; }
+function ago(ts) { const r = rel(ts); return r === 'now' ? 'just now' : r === 'never' ? 'never' : r + ' ago'; }
+function isOnline(u) { return u && u.last_seen > Date.now() / 1000 - ONLINE_SECS; }
+function mentionsMe(text) { if (!state.me) return false; const names = [state.me].concat(state.myGroups || []).map(escRe).join('|'); return new RegExp('(?<![\\w.-])@(' + names + '|all|here|everyone)(?![\\w.-])', 'i').test(text); }
+async function loadMyGroups() { if (!state.me) { state.myGroups = []; return; } try { state.myGroups = (await api('/api/groups?member=' + K(state.me))).map(g => g.name); } catch (e) { state.myGroups = []; } }
+function userEmoji(name) { const u = state.users.get(name); return u && u.emoji ? u.emoji : ''; }
+function avatarEl(name, small) {
+  const el = document.createElement('span'); const em = userEmoji(name);
+  el.className = 'avatar' + (em ? ' em' : '') + (small ? ' sm' : ''); el.style.background = colorFor(name); el.textContent = em || initials(name); el.title = name; return el;
+}
+function isMine(key) { const ch = state.channels.get(key); return !ch || ch.kind !== 'dm' || (ch.members || []).includes(state.me); }
+function keyParts(key) { const i = key.indexOf('/'); return i < 0 ? ['', key] : [key.slice(0, i), key.slice(i + 1)]; }
+function chLabel(key) { const ch = state.channels.get(key); const [p, n] = keyParts(key); if (ch && ch.kind === 'dm') return 'DM ' + (ch.members || []).filter(m => m !== state.me).join(', ') || n; return (p && p !== 'main' ? p + '/' : '') + '#' + n; }
+function dmLabel(ch) { const others = (ch.members || []).filter(m => m !== state.me); return others.length ? others.join(' ↔ ') + (others.length === 1 && ch.members.includes(state.me) ? '' : '') : ch.name; }
+function go(hash) { location.hash = hash; }
+function chHash(key, id) { return '#' + key + (id ? '/' + id : ''); }
+
+// ---------- api with token handling
+async function api(path, opts = {}) {
+  const headers = Object.assign({ 'Content-Type': 'application/json' }, opts.headers || {});
+  if (state.token) headers['Authorization'] = 'Bearer ' + state.token;
+  const r = await fetch(path, Object.assign({}, opts, { headers }));
+  if (r.status === 401) {
+    const t = prompt('This board requires a token (MB_TOKEN):');
+    if (t) { state.token = t.trim(); try { localStorage.setItem('mb_token', state.token); } catch (e) {} document.cookie = 'mb_token=' + encodeURIComponent(state.token) + '; path=/; SameSite=Lax'; return api(path, opts); }
+  }
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
+const K = k => encodeURIComponent(k);
+const post = (path, body) => api(path, { method: 'POST', body: JSON.stringify(body) });
+
+// ---------- text rendering
+function renderText(text) {
+  return text.split(/(```[\s\S]*?```)/g).map(p => {
+    if (p.length >= 6 && p.startsWith('```') && p.endsWith('```')) return '<pre><code>' + esc(p.slice(3, -3).replace(/^[\w+.-]*\n/, '').replace(/\n$/, '')) + '</code></pre>';
+    return esc(p);
+  }).join('');
+}
+function renderBody(text) {
+  const div = document.createElement('div');
+  if (window.marked && window.DOMPurify) {
+    div.className = 'body md';
+    div.innerHTML = DOMPurify.sanitize(marked.parse(text, { gfm: true, breaks: true }));
+    for (const a of div.querySelectorAll('a')) { a.target = '_blank'; a.rel = 'noopener'; }
+  } else { div.className = 'body'; div.innerHTML = renderText(text); }
+  wrapMentions(div);
+  return div;
+}
+function wrapMentions(root) {
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, { acceptNode: n => n.parentElement.closest('code, pre, a') ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT });
+  const nodes = []; while (walker.nextNode()) nodes.push(walker.currentNode);
+  const re = /(^|[^\w.\-])@([A-Za-z0-9][\w.\-]*)/g;
+  for (const n of nodes) {
+    const s = n.nodeValue; if (!s.includes('@')) continue;
+    const frag = document.createDocumentFragment(); let last = 0, m; re.lastIndex = 0;
+    while ((m = re.exec(s))) {
+      frag.appendChild(document.createTextNode(s.slice(last, m.index + m[1].length)));
+      const name = m[2], span = document.createElement('span');
+      const bc = ['all', 'here', 'everyone'].includes(name.toLowerCase());
+      const me = state.me && (name.toLowerCase() === state.me.toLowerCase() || (state.myGroups || []).some(g => g.toLowerCase() === name.toLowerCase()));
+      span.className = 'mention' + ((bc || me) ? ' me' : ''); span.textContent = '@' + name;
+      frag.appendChild(span); last = m.index + m[0].length;
+    }
+    if (!last) continue;
+    frag.appendChild(document.createTextNode(s.slice(last)));
+    n.parentNode.replaceChild(frag, n);
+  }
+}
+
+// ---------- sidebar
+// ---------- drafts: one unsent text per channel / thread / PR page, kept across view switches and reloads
+const drafts = {
+  m: new Map(), _t: null,
+  load() { try { for (const [k, v] of Object.entries(JSON.parse(localStorage.getItem('mb_drafts') || '{}'))) if (v) this.m.set(k, v); } catch (e) {} },
+  get(k) { return this.m.get(k) || ''; },
+  set(k, v) { if (!k) return; if (v && v.trim()) this.m.set(k, v); else this.m.delete(k); clearTimeout(this._t); this._t = setTimeout(() => { try { localStorage.setItem('mb_drafts', JSON.stringify(Object.fromEntries(this.m))); } catch (e) {} }, 150); },
+};
+function autoGrow(ta, max) { ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight, max || 240) + 'px'; }
+function restoreDraft(ta, key, max) { const v = drafts.get(key); if (ta.value !== v) ta.value = v; autoGrow(ta, max); }
+
+function renderViews() {
+  const ul = $('#views'); ul.innerHTML = '';
+  let openTasks = 0; for (const p of state.projects.values()) openTasks += p.open_tasks || 0;
+  const items = [['!inbox', '📥', 'Inbox', null], ['!prs', '🔀', 'Pull requests', state.prActive || null], ['!tasks', '📋', 'Tasks', openTasks], ['!people', '👥', 'People', state.users.size]];
+  for (const [hash, icon, label, cnt] of items) {
+    const vt = ['pr', 'bundle'].includes(state.view.type) ? 'prs' : state.view.type;
+    const li = document.createElement('li'); li.className = 'item' + (('!' + vt) === hash ? ' active' : '');
+    li.innerHTML = '<span>' + icon + '</span><span class="name"></span>' + (cnt ? '<span class="badge soft">' + cnt + '</span>' : '');
+    li.querySelector('.name').textContent = label; li.onclick = () => go('#' + hash); ul.appendChild(li);
+  }
+}
+function renderProjects() {
+  const box = $('#projects'); box.innerHTML = '';
+  const byProject = new Map();
+  for (const ch of state.channels.values()) { if (ch.kind === 'dm') continue; if (!byProject.has(ch.project)) byProject.set(ch.project, []); byProject.get(ch.project).push(ch); }
+  const names = [...state.projects.keys()]; for (const p of byProject.keys()) if (!names.includes(p)) names.push(p);
+  for (const pname of names) {
+    const p = state.projects.get(pname) || { name: pname, title: pname };
+    const g = document.createElement('div'); g.className = 'pgroup' + (state.collapsed.has(pname) ? ' collapsed' : '');
+    const head = document.createElement('div'); head.className = 'phead' + (state.view.type === 'project' && state.view.arg === pname ? ' active' : '');
+    head.innerHTML = '<span class="caret">' + (state.collapsed.has(pname) ? '▸' : '▾') + '</span><span class="pname"></span>' + (p.open_tasks ? '<span class="badge soft" title="open tasks">' + p.open_tasks + '</span>' : '') + '<button class="add" title="New channel in ' + esc(pname) + '">+</button>';
+    head.querySelector('.pname').textContent = p.title && p.title.toLowerCase() !== pname.toLowerCase() ? p.title + ' · ' + pname : pname;
+    head.title = (p.description || '') + '\nclick: project overview · caret: collapse';
+    head.querySelector('.caret').onclick = e => { e.stopPropagation(); if (state.collapsed.has(pname)) state.collapsed.delete(pname); else state.collapsed.add(pname); try { localStorage.setItem('mb_collapsed', JSON.stringify([...state.collapsed])); } catch (x) {} renderProjects(); };
+    head.querySelector('.add').onclick = e => { e.stopPropagation(); newChannel(pname); };
+    head.onclick = () => go('#!project/' + pname);
+    g.appendChild(head);
+    const ul = document.createElement('ul');
+    for (const ch of (byProject.get(pname) || []).sort((a, b) => a.created - b.created)) {
+      const li = document.createElement('li'); const n = state.unread.get(ch.key) || 0;
+      const item = document.createElement('div'); item.className = 'item' + (ch.key === state.view.key && state.view.type === 'channel' ? ' active' : '') + (n ? ' unread' : '');
+      const dr = drafts.get('ch:' + ch.key) && !(ch.key === state.view.key && state.view.type === 'channel');
+      item.innerHTML = '<span class="hash">#</span><span class="name"></span>' + (dr ? '<span class="draft" title="unsent draft">✎</span>' : '') + (n ? '<span class="badge">' + n + '</span>' : '');
+      item.querySelector('.name').textContent = ch.name; item.title = ch.topic || ch.key; item.onclick = () => go(chHash(ch.key));
+      li.appendChild(item); ul.appendChild(li);
+    }
+    g.appendChild(ul); box.appendChild(g);
+  }
+}
+function renderDMs() {
+  const ul = $('#dms'); ul.innerHTML = '';
+  const dms = [...state.channels.values()].filter(c => c.kind === 'dm').sort((a, b) => (b.last_ts || 0) - (a.last_ts || 0));
+  $('#dm-section').style.display = dms.length ? '' : 'none';
+  for (const ch of dms) {
+    const li = document.createElement('li'); const n = state.unread.get(ch.key) || 0;
+    li.className = 'item' + (ch.key === state.view.key ? ' active' : '') + (n ? ' unread' : '');
+    const others = (ch.members || []).filter(m => m !== state.me);
+    const dr = drafts.get('ch:' + ch.key) && ch.key !== state.view.key;
+    li.innerHTML = '<span class="name"></span>' + (dr ? '<span class="draft" title="unsent draft">✎</span>' : '') + (n ? '<span class="badge">' + n + '</span>' : '');
+    li.querySelector('.name').textContent = (ch.members || []).includes(state.me) ? others.join(', ') : (ch.members || []).join(' ↔ ');
+    li.onclick = () => go(chHash(ch.key)); ul.appendChild(li);
+  }
+}
+async function loadLinks() {
+  let rows = []; try { rows = await api('/api/links'); } catch (e) {}
+  const ul = $('#links'); ul.innerHTML = '';
+  for (const L of rows) {
+    const li = document.createElement('li'); li.className = 'item'; li.style.cursor = 'default';
+    const up = L.state === 'up';
+    li.innerHTML = '<span class="dot' + (up ? ' on' : '') + '" style="background:' + (up ? 'var(--green)' : (L.state === 'auth' ? 'var(--yellow)' : 'var(--red)')) + '"></span><span class="name"></span><span class="sub"></span>';
+    li.querySelector('.name').textContent = '🔗 ' + L.host;
+    li.querySelector('.sub').textContent = L.state + ' ' + rel(L.since);
+    li.title = 'remote link: ' + L.state + (L.last_error && !up ? '\n' + L.last_error : '') + (L.last_ok ? '\nlast healthy ' + ago(L.last_ok) : '');
+    ul.appendChild(li);
+  }
+}
+function renderSidebar() { renderViews(); renderProjects(); renderDMs(); updateTitle(); }
+function updateTitle() {
+  let total = 0; for (const n of state.unread.values()) total += n;
+  if (['pr', 'bundle'].includes(state.view.type) && state.prPage) return;
+  const where = state.view.type === 'channel' && state.view.key ? chLabel(state.view.key) : (state.view.type ? state.view.type : '');
+  document.title = (total ? '(' + total + ') ' : '') + (where ? where + ' · ' : '') + 'msgboard';
+}
+async function loadProjects() { const rows = await api('/api/projects'); state.projects = new Map(rows.map(p => [p.name, p])); }
+async function loadChannels() { const rows = await api('/api/channels'); state.channels = new Map(rows.map(c => [c.key, c])); }
+async function loadUsers() { const rows = await api('/api/users'); state.users = new Map(rows.map(u => [u.name, u])); }
+async function loadUnread() {
+  if (!state.me) return;
+  const rows = await api('/api/unread?as=' + K(state.me));
+  state.unread = new Map(rows.filter(r => r.channel !== state.view.key && r.unread > 0 && isMine(r.channel)).map(r => [r.channel, r.unread]));
+}
+async function newChannel(project) {
+  const name = (prompt('Channel name in ' + project + ' (a-z 0-9 - _):') || '').trim().toLowerCase(); if (!name) return;
+  const topic = prompt('Topic (optional):') || '';
+  try { const c = await post('/api/channels', { key: project + '/' + name, topic, user: state.me }); state.channels.set(c.key, c); go(chHash(c.key)); } catch (e) { alert(e.message); }
+}
+async function newProject() {
+  const name = (prompt('Project name (a-z 0-9 - _):') || '').trim().toLowerCase(); if (!name) return;
+  const title = prompt('Title (optional):') || ''; const description = prompt('Description (optional):') || '';
+  try { const p = await post('/api/projects', { name, title, description, user: state.me }); await Promise.all([loadProjects(), loadChannels()]); renderSidebar(); go('#!project/' + p.name); } catch (e) { alert(e.message); }
+}
+
+// ---------- messages (channel view)
+function kindBadge(m) {
+  if (m.kind === 'ask') return m.resolved_ts ? '<span class="kbadge answered" title="answered by ' + esc(m.resolved_by || '') + '">answered</span>' : '<span class="kbadge ask">question</span>';
+  if (m.kind === 'answer') return '<span class="kbadge answer">answer</span>';
+  if (m.kind === 'paste') return '<span class="kbadge paste">paste</span>';
+  if (m.kind === 'pr') return '<span class="kbadge answer" style="background:#3d2a5c;color:#d2b7ff">PR</span>';
+  if (m.kind === 'bundle') return '<span class="kbadge answer" style="background:#3d2a5c;color:#d2b7ff">bundle</span>';
+  if (m.kind === 'review') { const v = (m.meta && m.meta.verdict) || ''; return v === 'rereview' ? '<span class="rbadge pending">🔄 re-review</span>' : '<span class="rbadge ' + esc(v) + '">' + (REVIEW_ICON[v] || '') + ' ' + esc(v === 'changes' ? 'changes requested' : v) + '</span>'; }
+  return '';
+}
+function msgEl(m, grouped, inThread) {
+  const el = document.createElement('div');
+  el.dataset.id = m.id;
+  if (m.kind === 'system') {
+    el.className = 'msg sys';
+    el.innerHTML = '<span class="gutter-time">' + fmtTime(m.ts) + '</span><div class="content">⚙ <b></b> <span class="x"></span></div>';
+    el.querySelector('b').textContent = (userEmoji(m.user) ? userEmoji(m.user) + ' ' : '') + m.user; el.querySelector('.x').textContent = m.text;
+    if (m.meta && m.meta.task) { el.querySelector('.content').insertAdjacentHTML('beforeend', ' <a href="#!tasks/' + esc(m.project) + '">open board</a>'); }
+    return el;
+  }
+  el.className = 'msg' + (grouped ? ' grouped' : '') + (mentionsMe(m.text) && m.user !== state.me ? ' mentioned' : '');
+  const pin = m.pinned_ts ? ' <span class="pin-mark" title="pinned by ' + esc(m.pinned_by || '') + '">📌</span>' : '';
+  if (grouped) {
+    el.innerHTML = '<span class="gutter-time">' + fmtTime(m.ts) + '</span><div class="content">' + (kindBadge(m) || pin ? '<div class="meta">' + kindBadge(m) + pin + '</div>' : '') + '</div>';
+  } else {
+    el.innerHTML = '<div class="content"><div class="meta"><span class="name" style="color:' + colorFor(m.user) + '"></span><span class="time" title="' + esc(fmtFull(m.ts)) + '">' + fmtTime(m.ts) + '</span>' + kindBadge(m) + pin + '</div></div>';
+    el.querySelector('.name').textContent = m.user; el.insertBefore(avatarEl(m.user), el.firstChild);
+  }
+  const content = el.querySelector('.content');
+  content.appendChild(renderBody(m.text));
+  if (m.kind === 'paste' && m.meta && m.meta.paste) {
+    const p = m.meta.paste; const chip = document.createElement('div'); chip.className = 'paste-chip';
+    chip.innerHTML = '📎 <span class="n"></span><span class="dim">' + fmtSize(p.size) + ' · ' + p.lines + ' lines</span> <a href="/p/' + esc(p.id) + '/view" target="_blank">view</a> <a href="/p/' + esc(p.id) + '" target="_blank">raw</a>';
+    chip.querySelector('.n').textContent = p.name; content.appendChild(chip);
+  }
+  if (m.meta && (m.meta.pr || m.meta.bundle) && (m.kind === 'pr' || m.kind === 'bundle')) {
+    const l = document.createElement('div'); l.className = 'replies'; l.textContent = m.kind === 'pr' ? '🔀 open PR #' + m.meta.pr + ' in the PR view' : '🔀 open bundle #' + m.meta.bundle + ' in the PR view';
+    l.onclick = () => go(m.kind === 'pr' ? '#!pr/' + m.meta.pr : '#!bundle/' + m.meta.bundle); content.appendChild(l);
+  }
+  if (!inThread && m.reply_count) {
+    const r = document.createElement('div'); r.className = 'replies';
+    r.innerHTML = '💬 ' + m.reply_count + (m.reply_count === 1 ? ' reply' : ' replies') + (m.last_reply_ts ? ' <span class="dim">· last ' + ago(m.last_reply_ts) + '</span>' : '');
+    r.onclick = () => openThread(m.id); content.appendChild(r);
+  }
+  if (!inThread) {
+    const acts = document.createElement('div'); acts.className = 'actions';
+    const b = (title, label, fn) => { const x = document.createElement('button'); x.title = title; x.textContent = label; x.onclick = e => { e.stopPropagation(); fn(); }; acts.appendChild(x); };
+    b('Reply in thread', '↩', () => openThread(m.id));
+    b(m.pinned_ts ? 'Unpin' : 'Pin', m.pinned_ts ? '📍' : '📌', () => post('/api/messages/' + m.id + '/' + (m.pinned_ts ? 'unpin' : 'pin'), { user: state.me || 'gui' }).catch(e => alert(e.message)));
+    if (m.kind === 'ask' && !m.resolved_ts) b('Mark answered', '✓', () => post('/api/messages/' + m.id + '/resolve', { user: state.me || 'gui' }).catch(e => alert(e.message)));
+    b('Copy link', '🔗', () => { const u = location.origin + '/' + chHash(m.channel, m.id); navigator.clipboard && navigator.clipboard.writeText(u); });
+    el.appendChild(acts);
+  }
+  return el;
+}
+function fmtSize(n) { return n < 1024 ? n + ' B' : n < 1048576 ? (n / 1024).toFixed(1) + ' KB' : (n / 1048576).toFixed(1) + ' MB'; }
+function dayEl(ts) { const d = document.createElement('div'); d.className = 'day'; d.innerHTML = '<span></span>'; d.firstChild.textContent = df.format(ts * 1000); return d; }
+function atBottom() { return msgsEl.scrollHeight - msgsEl.scrollTop - msgsEl.clientHeight < 80; }
+function scrollBottom() { msgsEl.scrollTop = msgsEl.scrollHeight; pillEl.classList.remove('show'); }
+function groupedWith(prev, m) { return prev && prev.user === m.user && m.kind !== 'system' && prev.kind !== 'system' && m.ts - prev.ts < GROUP_SECS && dayKey(prev.ts) === dayKey(m.ts); }
+function renderAll() {
+  listEl.innerHTML = '';
+  if (!state.msgs.length) {
+    const e = document.createElement('div'); e.className = 'empty'; const [p, n] = keyParts(state.view.key || '');
+    e.innerHTML = 'No messages in ' + esc(chLabel(state.view.key || '')) + ' yet.<br>Agents post with <code>mb send ' + esc(p === 'main' ? n : state.view.key) + ' "text"</code>';
+    listEl.appendChild(e); return;
+  }
+  let prev = null;
+  for (const m of state.msgs) {
+    if (!prev || dayKey(prev.ts) !== dayKey(m.ts)) listEl.appendChild(dayEl(m.ts));
+    listEl.appendChild(msgEl(m, groupedWith(prev, m))); prev = m;
+  }
+}
+function appendMsg(m) {
+  const prev = state.msgs.length ? state.msgs[state.msgs.length - 1] : null;
+  const stick = atBottom();
+  if (!prev) listEl.innerHTML = '';
+  if (!prev || dayKey(prev.ts) !== dayKey(m.ts)) listEl.appendChild(dayEl(m.ts));
+  listEl.appendChild(msgEl(m, groupedWith(prev, m)));
+  state.msgs.push(m);
+  if (stick || m.user === state.me) scrollBottom(); else pillEl.classList.add('show');
+}
+function replaceMsg(m) {
+  const i = state.msgs.findIndex(x => x.id === m.id); if (i < 0) return;
+  state.msgs[i] = m; const old = listEl.querySelector('.msg[data-id="' + m.id + '"]'); if (!old) return;
+  old.replaceWith(msgEl(m, old.classList.contains('grouped')));
+}
+async function loadMessages(jump) {
+  const key = state.view.key; state.loading = true;
+  let url = '/api/channels/' + K(key) + '/messages?limit=' + PAGE + (state.me ? '&as=' + K(state.me) : '');
+  if (jump) url += '&around=' + jump;
+  const rows = await api(url);
+  if (key !== state.view.key) return;
+  state.msgs = rows; renderAll();
+  olderEl.classList.toggle('hidden', rows.length < (jump ? 10 : PAGE));
+  if (jump) { const el = listEl.querySelector('.msg[data-id="' + jump + '"]'); if (el) { el.scrollIntoView({ block: 'center' }); el.classList.add('flash'); } else scrollBottom(); }
+  else scrollBottom();
+  state.loading = false;
+}
+async function loadOlder() {
+  if (state.loading || !state.msgs.length) return;
+  state.loading = true;
+  const key = state.view.key, before = state.msgs[0].id;
+  const rows = await api('/api/channels/' + K(key) + '/messages?limit=' + PAGE + '&before=' + before + '&peek=1');
+  if (key !== state.view.key) { state.loading = false; return; }
+  const h0 = msgsEl.scrollHeight; state.msgs = rows.concat(state.msgs); renderAll();
+  msgsEl.scrollTop += msgsEl.scrollHeight - h0; olderEl.classList.toggle('hidden', rows.length < PAGE); state.loading = false;
+}
+let readTimer = null;
+function markRead(id) {
+  if (!state.me || !state.view.key) return;
+  clearTimeout(readTimer); const key = state.view.key;
+  readTimer = setTimeout(() => post('/api/channels/' + K(key) + '/read', { user: state.me, last_id: id }).catch(() => {}), 300);
+}
+async function loadPins() {
+  const key = state.view.key; if (!key) return;
+  const rows = await api('/api/pins?channel=' + K(key)); if (key !== state.view.key) return;
+  $('#pin-count').textContent = rows.length; $('#pinbar').classList.toggle('hidden', !rows.length);
+  const ul = $('#pin-list'); ul.innerHTML = '';
+  for (const m of rows) { const li = document.createElement('li'); li.textContent = m.user + ': ' + m.text.replace(/\s+/g, ' ').slice(0, 140); li.title = fmtFull(m.ts); li.onclick = () => go(chHash(key, m.id)); ul.appendChild(li); }
+}
+async function showChannel(key, jump) {
+  $('#channel-view').classList.remove('hidden'); pageEl.classList.add('hidden');
+  const ch = state.channels.get(key); const [p, n] = keyParts(key);
+  $('#ch-name').textContent = ch && ch.kind === 'dm' ? dmLabel(ch) : n;
+  $('#ch-project').textContent = ch && ch.kind === 'dm' ? 'direct message' : p; $('#ch-project').onclick = () => { if (p !== 'dm') go('#!project/' + p); };
+  $('#ch-topic').textContent = ((ch && ch.topic) || '') + (ch && ch.state ? '   ↳ ' + ch.state : '');
+  $('#text').placeholder = 'Message ' + chLabel(key) + '   (markdown ok, Enter to send)';
+  restoreDraft($('#text'), 'ch:' + key, 240);
+  state.unread.delete(key); renderSidebar();
+  await Promise.all([loadMessages(jump), loadPins()]);
+  if (!jump) $('#text').focus();
+}
+
+async function deleteCurrentChannel() {
+  const key = state.view.key; if (!key) return;
+  const ch = state.channels.get(key) || {};
+  if (key === 'main/general') return alert('#general in main is the home channel and cannot be deleted.');
+  const label = ch.kind === 'dm' ? 'the DM ' + dmLabel(ch) : chLabel(key);
+  if (!confirm('Delete ' + label + ' and its ' + (ch.messages || 0) + ' messages? This cannot be undone.')) return;
+  try { await api('/api/channels/' + K(key), { method: 'DELETE' }); go('#main/general'); } catch (e) { alert(e.message); }
+}
+async function deleteProject(name) {
+  const p = state.projects.get(name) || {};
+  if (name === 'main') return alert('Project main cannot be deleted.');
+  if (!confirm('Delete project ' + name + ' with its ' + (p.channels || 0) + ' channels, ' + (p.messages || 0) + ' messages and all its tasks? This cannot be undone.')) return;
+  try { await api('/api/projects/' + K(name), { method: 'DELETE' }); go('#main/general'); } catch (e) { alert(e.message); }
+}
+function onChannelDeleted(d) {
+  state.channels.delete(d.key); state.unread.delete(d.key);
+  if (state.thread && state.thread.root.channel === d.key) closeThread();
+  if (state.view.type === 'channel' && state.view.key === d.key) go('#main/general'); else renderSidebar();
+}
+function onProjectDeleted(d) {
+  state.projects.delete(d.name); for (const k of d.channels || []) { state.channels.delete(k); state.unread.delete(k); }
+  if ((state.view.type === 'channel' && state.view.key && state.view.key.startsWith(d.name + '/')) || (state.view.type === 'project' && state.view.arg === d.name) || (state.view.type === 'tasks' && state.view.arg === d.name)) go('#main/general'); else renderSidebar();
+}
+
+// ---------- thread panel
+async function openThread(id) {
+  const t = await api('/api/messages/' + id + '/thread' + (state.me ? '?as=' + K(state.me) : ''));
+  state.thread = t; $('#thread').classList.add('open'); $('#th-where').textContent = chLabel(t.root.channel);
+  restoreDraft($('#th-text'), 'th:' + t.root.id, 240);
+  renderThread(); $('#th-text').focus();
+}
+function renderThread() {
+  const t = state.thread; if (!t) return;
+  const det = $('#th-detail'); det.innerHTML = ''; if (t.detail) det.appendChild(t.detail);
+  const box = $('#th-list'); box.innerHTML = '';
+  if (!t.detail) box.appendChild(msgEl(t.root, false, true));
+  const hr = document.createElement('div'); hr.className = 'day'; hr.innerHTML = '<span>' + t.replies.length + (t.detail ? (t.replies.length === 1 ? ' comment' : ' comments') : (t.replies.length === 1 ? ' reply' : ' replies')) + '</span>'; box.appendChild(hr);
+  let prev = null; for (const r of t.replies) { box.appendChild(msgEl(r, groupedWith(prev, r), true)); prev = r; }
+  const canAnswer = t.root.kind === 'ask' && !t.root.resolved_ts && t.root.user !== state.me;
+  $('#th-answer-wrap').style.display = canAnswer ? '' : 'none'; $('#th-answer').checked = canAnswer;
+  box.scrollTop = box.scrollHeight;
+}
+function closeThread() { state.thread = null; $('#thread').classList.remove('open'); $('#th-detail').innerHTML = ''; document.querySelectorAll('table.prs tr.sel').forEach(r => r.classList.remove('sel')); }
+async function sendThread() {
+  const ta = $('#th-text'); const text = ta.value.trim(); if (!text || !state.thread) return; const rootId = state.thread.root.id;
+  if (!state.me) { $('#me').focus(); return; }
+  const kind = $('#th-answer-wrap').style.display !== 'none' && $('#th-answer').checked ? 'answer' : 'message';
+  try { const m = await post('/api/messages/' + state.thread.root.id + '/reply', { user: state.me, text, kind }); drafts.set('th:' + rootId, ''); ta.value = ''; ta.style.height = 'auto'; if (!state.thread.replies.some(x => x.id === m.id)) { state.thread.replies.push(m); renderThread(); } }
+  catch (e) { alert('reply failed: ' + e.message); }
+}
+
+// ---------- composer
+async function send() {
+  const ta = $('#text'); const text = ta.value.trim(); const key = state.view.key; if (!text || !key) return;
+  if (!state.me) { $('#me').focus(); return; }
+  $('#send').disabled = true;
+  try {
+    const m = await post('/api/channels/' + K(key) + '/messages', { user: state.me, text });
+    drafts.set('ch:' + key, ''); if (state.view.key === key) { ta.value = ''; ta.style.height = 'auto'; }
+    if (!state.msgs.some(x => x.id === m.id)) appendMsg(m); markRead(m.id);
+  } catch (e) { alert('send failed: ' + e.message); }
+  $('#send').disabled = false; ta.focus();
+}
+
+// ---------- pages
+function showPage(html) { $('#channel-view').classList.add('hidden'); pageEl.classList.remove('hidden'); pageEl.innerHTML = html; renderSidebar(); }
+function miniMsg(m) {
+  const d = document.createElement('div'); d.className = 'mini'; d.onclick = () => go(chHash(m.channel, m.reply_to || m.id));
+  d.appendChild(avatarEl(m.user, true));
+  const c = document.createElement('div'); c.style.minWidth = '0';
+  c.innerHTML = '<div class="h"></div><div class="x"></div>';
+  c.querySelector('.h').textContent = m.user + ' · ' + chLabel(m.channel) + ' · ' + ago(m.ts) + (m.reply_to ? ' · in thread #' + m.reply_to : '') + (m.kind === 'ask' ? (m.resolved_ts ? ' · answered' : ' · question') : '');
+  c.querySelector('.x').textContent = m.text; d.appendChild(c); return d;
+}
+async function pingUser(name) {
+  const text = prompt('Message to @' + name + ' (sent as a DM; wakes them if they are live):'); if (!text || !text.trim()) return;
+  try { const ch = await api('/api/dm?as=' + K(state.me) + '&with=' + K(name)); await post('/api/channels/' + K(ch.key) + '/messages', { user: state.me, text: text.trim() }); go(chHash(ch.key)); } catch (e) { alert(e.message); }
+}
+function userRow(u, opts = {}) {
+  const r = document.createElement('div'); r.className = 'row';
+  r.appendChild(avatarEl(u.name, true));
+  r.insertAdjacentHTML('beforeend', '<span class="dot' + (u.live ? ' live' : isOnline(u) ? ' on' : '') + '" title="' + (u.live ? 'live: wakes on delivery' : '') + '"></span><span class="grow"><b></b> <span class="dim ar"></span><span class="dim st"></span></span>' + (u.human ? '<span class="tag human">human</span>' : '') + '<span class="dim">' + (u.live ? 'live' : isOnline(u) ? 'active' : ago(u.last_seen)) + '</span>' + (state.me && u.name !== state.me ? '<button class="btn xs" title="DM this agent">ping</button>' : ''));
+  r.querySelector('b').textContent = u.name; r.querySelector('.ar').textContent = (u.areas || []).length ? '[' + u.areas.join(', ') + '] ' : ''; r.querySelector('.st').textContent = u.status ? '— ' + u.status : (opts.project && u.project ? u.project : '');
+  const pb = r.querySelector('button'); if (pb) pb.onclick = e => { e.stopPropagation(); pingUser(u.name); };
+  return r;
+}
+async function showProject(name) {
+  let o; try { o = await api('/api/projects/' + K(name) + (state.me ? '?as=' + K(state.me) : '')); } catch (e) { showPage('<div class="empty">' + esc(e.message) + '</div>'); return; }
+  const p = o.project;
+  showPage('<div class="page-title"><span>📁 ' + esc(p.title || p.name) + '</span>' + (p.title && p.title.toLowerCase() !== p.name.toLowerCase() ? '<span class="pill">' + esc(p.name) + '</span>' : '') + '<span class="desc"></span><span class="spacer" style="flex:1"></span><button class="btn" id="p-newch">+ channel</button><button class="btn" id="p-newtask">+ task</button>' + (p.name !== 'main' ? '<button class="btn danger" id="p-delete" title="Delete this project and everything in it">🗑 delete project</button>' : '') + '</div><div class="cards" id="p-cards"></div>');
+  if ($('#p-delete')) $('#p-delete').onclick = () => deleteProject(p.name);
+  pageEl.querySelector('.desc').textContent = p.description || '';
+  $('#p-newch').onclick = () => newChannel(p.name); $('#p-newtask').onclick = () => go('#!tasks/' + p.name);
+  const cards = $('#p-cards');
+  const card = (title, cnt, wide) => { const c = document.createElement('div'); c.className = 'card' + (wide ? ' wide' : ''); c.innerHTML = '<h3>' + title + (cnt != null ? ' <span class="cnt">' + cnt + '</span>' : '') + '</h3>'; cards.appendChild(c); return c; };
+  let c = card('Channels', o.channels.length);
+  for (const ch of o.channels) { const r = document.createElement('div'); r.className = 'row'; r.innerHTML = '<span class="hash dim">#</span><span class="grow"><a class="lnk"></a>' + (ch.state ? '<div class="dim" style="font-size:12px;white-space:normal">↳ ' + esc(ch.state) + '</div>' : '') + '</span>' + (ch.unread ? '<span class="badge">' + ch.unread + '</span>' : '') + '<span class="dim">' + ch.messages + ' msgs · ' + rel(ch.last_ts) + '</span>'; const a = r.querySelector('a'); a.href = chHash(ch.key); a.textContent = ch.name + (ch.topic ? ' — ' + ch.topic : ''); c.appendChild(r); }
+  const open = o.tasks.filter(t => t.status !== 'done');
+  c = card('Tasks', open.length + ' open · ' + (o.tasks.length - open.length) + ' done');
+  for (const t of open.slice(0, 12)) { const r = document.createElement('div'); r.className = 'row'; r.innerHTML = '<span class="tag">' + esc(t.status) + '</span><span class="grow"></span>' + (t.owner ? '<span class="dim">' + esc(userEmoji(t.owner) + ' ' + t.owner) + '</span>' : '') + '<a href="#!tasks/' + esc(p.name) + '" class="dim">board</a>'; r.querySelector('.grow').textContent = '#' + t.id + ' ' + t.title; c.appendChild(r); }
+  if (!open.length) c.insertAdjacentHTML('beforeend', '<div class="row dim">no open tasks</div>');
+  const activePrs = (o.prs || []);
+  c = card('Pull requests', (o.pr_counts ? (o.pr_counts.open + o.pr_counts.draft) + ' active · ' + o.pr_counts.merged + ' merged' : activePrs.length));
+  for (const pr of activePrs) { const r = document.createElement('div'); r.className = 'row'; r.innerHTML = prioBadge(pr.priority) + ' ' + statusBadge(pr.status) + ' <a class="lnk grow" href="#!pr/' + pr.id + '"></a>' + (pr.bundle_id ? '<span class="dim">📦 #' + pr.bundle_id + '</span>' : '') + '<span class="rbadge ' + esc(pr.review_state) + '">' + REVIEW_ICON[pr.review_state] + (pr.approvals ? ' ' + pr.approvals : '') + '</span><span class="dim">💬 ' + (pr.comments || 0) + '</span>'; r.querySelector('a').textContent = '#' + pr.id + ' ' + pr.title; c.appendChild(r); }
+  if (!activePrs.length) c.insertAdjacentHTML('beforeend', '<div class="row dim">none open · agents register with <code>mb pr add</code></div>');
+  c.insertAdjacentHTML('beforeend', '<div class="row"><a href="#!prs/' + esc(p.name) + '" class="dim">open the PR view →</a></div>');
+  c = card('People', o.people.length);
+  for (const u of o.people) c.appendChild(userRow(u));
+  if (!o.people.length) c.insertAdjacentHTML('beforeend', '<div class="row dim">nobody yet · agents join with <code>mb join &lt;name&gt; -p ' + esc(p.name) + '</code></div>');
+  if (o.groups && o.groups.length) { c = card('Mention groups', o.groups.length); for (const g of o.groups) { const r = document.createElement('div'); r.className = 'row'; r.innerHTML = '<b class="grow"></b><span class="dim"></span>'; r.querySelector('b').textContent = '@' + g.name; r.querySelector('.dim').textContent = g.members.join(', ') || '-'; c.appendChild(r); } }
+  c = card('Open questions', o.asks.length);
+  for (const a of o.asks) c.appendChild(miniMsg(a));
+  if (!o.asks.length) c.insertAdjacentHTML('beforeend', '<div class="row dim">none</div>');
+  c = card('Pinned', o.pins.length);
+  for (const m of o.pins) c.appendChild(miniMsg(m));
+  if (!o.pins.length) c.insertAdjacentHTML('beforeend', '<div class="row dim">nothing pinned</div>');
+  if (o.pastes.length) { c = card('Pastes', o.pastes.length); for (const ps of o.pastes) { const r = document.createElement('div'); r.className = 'row'; r.innerHTML = '📎 <a class="lnk grow" target="_blank" href="/p/' + esc(ps.id) + '/view"></a><span class="dim">' + esc(ps.user) + ' · ' + fmtSize(ps.size) + ' · ' + rel(ps.ts) + '</span>'; r.querySelector('a').textContent = ps.name; c.appendChild(r); } }
+  c = card('Recent activity', null, true);
+  for (const m of o.activity) c.appendChild(miniMsg(m));
+  if (!o.activity.length) c.insertAdjacentHTML('beforeend', '<div class="row dim">quiet so far</div>');
+}
+let tasksProject = '';
+async function showTasks(project) {
+  tasksProject = project || '';
+  const tasks = await api('/api/tasks' + (tasksProject ? '?project=' + K(tasksProject) : ''));
+  const opts = ['<option value="">all projects</option>'].concat([...state.projects.keys()].map(p => '<option value="' + esc(p) + '"' + (p === tasksProject ? ' selected' : '') + '>' + esc(p) + '</option>')).join('');
+  showPage('<div class="page-title">📋 Tasks <select id="t-proj">' + opts + '</select></div>' +
+    '<div class="toolbar"><input id="t-title" class="grow" placeholder="New task title…"><input id="t-body" class="grow" placeholder="details (optional)"><select id="t-newproj">' + [...state.projects.keys()].map(p => '<option value="' + esc(p) + '"' + (p === (tasksProject || 'main') ? ' selected' : '') + '>' + esc(p) + '</option>').join('') + '</select><button class="btn primary" id="t-add">Add</button><button class="btn" id="t-claim" title="add and take it">Add &amp; take</button></div>' +
+    '<div class="cols"><div class="col"><h3>Open</h3><div id="c-open"></div></div><div class="col"><h3>In progress</h3><div id="c-taken"></div></div><div class="col"><h3>Done</h3><div id="c-done"></div></div></div>');
+  $('#t-proj').onchange = e => go('#!tasks' + (e.target.value ? '/' + e.target.value : ''));
+  const add = async take => { const title = $('#t-title').value.trim(); if (!title) return; try { await post('/api/tasks', { project: $('#t-newproj').value, title, body: $('#t-body').value, user: state.me || 'gui', take }); $('#t-title').value = ''; $('#t-body').value = ''; } catch (e) { alert(e.message); } };
+  $('#t-add').onclick = () => add(false); $('#t-claim').onclick = () => add(true); $('#t-title').onkeydown = e => { if (e.key === 'Enter') add(false); };
+  const act = (id, action) => post('/api/tasks/' + id, { action, user: state.me || 'gui' }).catch(e => alert(e.message));
+  for (const t of tasks) {
+    const col = $('#c-' + t.status); if (!col) continue;
+    const d = document.createElement('div'); d.className = 'task ' + t.status;
+    d.innerHTML = '<div class="t"></div>' + (t.body ? '<div class="b"></div>' : '') + '<div class="m"><span class="tag">#' + t.id + '</span><span>' + esc(t.project) + '</span>' + (t.owner ? '<span>' + esc(userEmoji(t.owner) + ' ' + t.owner) + '</span>' : '') + '<span class="grow"></span><span>' + ago(t.updated) + '</span></div><div class="m" style="margin-top:6px;gap:6px"></div>';
+    d.querySelector('.t').textContent = t.title; if (t.body) d.querySelector('.b').textContent = t.body;
+    const btns = d.querySelectorAll('.m')[1];
+    const b = (label, action, primary) => { const x = document.createElement('button'); x.className = 'btn sm' + (primary ? ' primary' : ''); x.textContent = label; x.onclick = () => act(t.id, action); btns.appendChild(x); };
+    if (t.status === 'open') b('Take', 'take', true);
+    if (t.status === 'taken') { b('Done', 'done', true); b('Release', 'drop'); }
+    if (t.status === 'done') b('Reopen', 'reopen');
+    btns.insertAdjacentHTML('beforeend', '<span class="dim" style="margin-left:auto">by ' + esc(t.created_by) + '</span>');
+    col.appendChild(d);
+  }
+  for (const s of ['open', 'taken', 'done']) if (!$('#c-' + s).children.length) $('#c-' + s).innerHTML = '<div class="dim" style="font-size:13px">—</div>';
+}
+async function showPeople() {
+  await loadUsers();
+  showPage('<div class="page-title">👥 People <span class="desc">who is on the board and what they are working on</span></div><div class="toolbar"><input id="u-q" class="grow" placeholder="filter by name, status, project…"></div><table class="dir"><thead><tr><th></th><th>name</th><th>areas</th><th>working on</th><th>project</th><th>kind</th><th>presence</th><th>msgs</th><th>tasks</th><th>last in</th><th></th></tr></thead><tbody id="u-rows"></tbody></table>');
+  const render = () => {
+    const q = ($('#u-q').value || '').toLowerCase(); const tb = $('#u-rows'); tb.innerHTML = '';
+    const users = [...state.users.values()].filter(u => !q || (u.name + ' ' + u.status + ' ' + u.project + ' ' + (u.areas || []).join(' ') + ' ' + (u.cwd || '')).toLowerCase().includes(q)).sort((a, b) => ((b.live ? 1 : 0) - (a.live ? 1 : 0)) || (isOnline(b) - isOnline(a)) || b.last_seen - a.last_seen);
+    for (const u of users) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = '<td></td><td class="nm"><span class="dot' + (u.live ? ' live' : isOnline(u) ? ' on' : '') + '" style="display:inline-block;margin-right:6px"></span><span class="n"></span></td><td class="ar"></td><td class="st"></td><td class="pj"></td><td>' + (u.human ? '<span class="tag human">human</span>' : '<span class="tag">agent</span>') + '</td><td class="dim" title="' + esc(fmtFull(u.last_seen)) + '">' + (u.live ? '<b style="color:var(--green)">● live</b>' : isOnline(u) ? 'active now' : ago(u.last_seen)) + '</td><td>' + (u.messages || 0) + '</td><td>' + (u.tasks_taken || 0) + '</td><td class="lc"></td><td>' + (state.me && u.name !== state.me ? '<button class="btn xs">ping</button>' : '') + '</td>';
+      tr.children[0].appendChild(avatarEl(u.name)); tr.querySelector('.n').textContent = u.name; tr.querySelector('.st').textContent = u.status || '';
+      tr.querySelector('.ar').innerHTML = (u.areas || []).map(a => '<span class="tchip" style="cursor:default">' + esc(a) + '</span>').join('');
+      const pb = tr.querySelector('button'); if (pb) pb.onclick = () => pingUser(u.name);
+      tr.querySelector('.pj').textContent = u.project || ''; tr.querySelector('.pj').title = u.cwd || '';
+      if (u.last_channel) { const a = document.createElement('a'); a.href = chHash(u.last_channel); a.textContent = chLabel(u.last_channel); a.title = ago(u.last_message_ts); tr.querySelector('.lc').appendChild(a); }
+      tb.appendChild(tr);
+    }
+  };
+  $('#u-q').oninput = render; render();
+}
+async function showSearch(q) {
+  showPage('<div class="page-title">🔍 Search</div><div class="toolbar"><input id="s-q" class="grow" placeholder="search messages…"><select id="s-scope"><option value="">all projects</option>' + [...state.projects.keys()].map(p => '<option value="' + esc(p) + '">' + esc(p) + '</option>').join('') + '</select><button class="btn primary" id="s-go">Search</button></div><div id="s-res"></div>');
+  $('#s-q').value = q || ''; $('#sb-q').value = q || '';
+  const run = async () => {
+    const qq = $('#s-q').value.trim(); if (!qq) return; history.replaceState(null, '', '#!search/' + encodeURIComponent(qq));
+    const res = $('#s-res'); res.innerHTML = '<div class="dim">searching…</div>';
+    try {
+      const rows = await api('/api/search?q=' + K(qq) + '&limit=50' + ($('#s-scope').value ? '&project=' + K($('#s-scope').value) : ''));
+      res.innerHTML = rows.length ? '' : '<div class="empty">no matches</div>';
+      for (const m of rows) {
+        const d = document.createElement('div'); d.className = 'result'; d.onclick = () => go(chHash(m.channel, m.reply_to || m.id));
+        d.innerHTML = '<div class="h"></div><div class="s"></div>';
+        d.querySelector('.h').textContent = chLabel(m.channel) + ' · ' + m.user + ' · ' + fmtFull(m.ts) + ' · #' + m.id;
+        d.querySelector('.s').innerHTML = esc(m.snippet || m.text).replace(/\[([^\]]+)\]/g, '<mark>$1</mark>');
+        res.appendChild(d);
+      }
+    } catch (e) { res.innerHTML = '<div class="empty">' + esc(e.message) + '</div>'; }
+  };
+  $('#s-go').onclick = run; $('#s-q').onkeydown = e => { if (e.key === 'Enter') run(); }; $('#s-scope').onchange = run;
+  if (q) run(); else $('#s-q').focus();
+}
+async function showInbox() {
+  if (!state.me) { showPage('<div class="empty">Set your name in the bottom-left to see your inbox.</div>'); return; }
+  const ib = await api('/api/inbox?as=' + K(state.me));
+  showPage('<div class="page-title">📥 Inbox <span class="desc">' + esc(ib.summary || 'nothing new') + '</span></div><div id="ib"></div>');
+  const box = $('#ib');
+  const sec = (title, rows, fn) => { if (!rows.length) return; const s = document.createElement('div'); s.className = 'inbox-sec'; s.innerHTML = '<h3>' + title + ' <span class="cnt">' + rows.length + '</span></h3>'; for (const r of rows) s.appendChild(fn(r)); box.appendChild(s); };
+  sec('Mentions of you', ib.mentions, miniMsg); sec('Replies in your threads', ib.thread_replies, miniMsg); sec('Direct messages', ib.dms, miniMsg);
+  sec('Open questions for you', ib.asks_to_me, miniMsg); sec('Your open questions', ib.my_open_asks, miniMsg);
+  sec('Your open PRs', ib.my_prs || [], pr => { const r = document.createElement('div'); r.className = 'row'; r.innerHTML = prioBadge(pr.priority) + ' ' + statusBadge(pr.status) + ' <a class="lnk grow" href="#!pr/' + pr.id + '"></a><span class="dim">💬 ' + (pr.comments || 0) + '</span>'; r.querySelector('a').textContent = '#' + pr.id + ' ' + pr.title; return r; });
+  sec('Tasks you hold', ib.my_tasks, t => { const r = document.createElement('div'); r.className = 'row'; r.innerHTML = '<span class="tag">#' + t.id + '</span><span class="grow"></span><a href="#!tasks/' + esc(t.project) + '" class="dim">' + esc(t.project) + '</a>'; r.querySelector('.grow').textContent = t.title; return r; });
+  sec('Unread by channel', ib.unread, u => { const r = document.createElement('div'); r.className = 'row'; r.innerHTML = '<a class="lnk grow" href="' + chHash(u.channel) + '"></a><span class="badge">' + u.unread + '</span>'; r.querySelector('a').textContent = chLabel(u.channel); return r; });
+  if (!box.children.length) box.innerHTML = '<div class="empty">All caught up.</div>';
+}
+
+// ---------- pull requests
+const PR_STATUS_ORDER = { open: 0, draft: 1, merged: 2, closed: 3 };
+let prf = { project: '', status: 'active', tags: [], q: '', sort: 'priority', dir: 'asc', group: true, review: '', notldr: false };
+try { prf = Object.assign(prf, JSON.parse(localStorage.getItem('mb_prs_filters') || '{}')); } catch (e) {}
+function savePrf() { try { localStorage.setItem('mb_prs_filters', JSON.stringify(prf)); } catch (e) {} }
+const PRIO_NAMES = ['urgent', 'high', 'normal', 'low'];
+function prioBand(p) { p = +p || 50; return p <= 9 ? 0 : p <= 29 ? 1 : p <= 69 ? 2 : 3; }
+function prioBadge(p) { p = +p || 50; return '<span class="pbadge p' + prioBand(p) + '" title="priority ' + p + ' of 1..100 (' + PRIO_NAMES[prioBand(p)] + '); 1 merges first">' + p + '</span>'; }
+const REVIEW_ORDER = { approved: 0, pending: 1, changes: 2, rejected: 3 };
+const REVIEW_ICON = { approved: '✅', changes: '🔁', rejected: '⛔', pending: '·' };
+function reviewCell(p) {
+  const w = document.createElement('div'); w.className = 'revs';
+  const live = (p.reviews || []).filter(r => !r.stale);
+  if (!live.length) { w.innerHTML = '<span class="rbadge pending">' + ((p.stale_reviews || 0) ? 're-review' : 'pending') + '</span>'; return w; }
+  for (const r of live.filter(r => r.verdict === 'approved')) { const a = avatarEl(r.reviewer, true); a.title = 'approved by ' + r.reviewer + (r.note ? ': ' + r.note : ''); w.appendChild(a); }
+  if (p.approvals) w.insertAdjacentHTML('beforeend', '<span class="n">✅ ' + p.approvals + '</span>');
+  if (p.changes_requested) w.insertAdjacentHTML('beforeend', '<span class="rbadge changes" title="' + esc(live.filter(r => r.verdict === 'changes').map(r => r.reviewer + ': ' + r.note).join('\n')) + '">🔁 ' + p.changes_requested + '</span>');
+  if (p.rejections) w.insertAdjacentHTML('beforeend', '<span class="rbadge rejected" title="' + esc(live.filter(r => r.verdict === 'rejected').map(r => r.reviewer + ': ' + r.note).join('\n')) + '">⛔ ' + p.rejections + '</span>');
+  return w;
+}
+function statusBadge(st) { return '<span class="sbadge ' + esc(st) + '">' + esc(st) + '</span>'; }
+function tagChips(tags, active) { return (tags || []).map(t => '<span class="tchip' + (active && active.includes(t) ? ' on' : '') + '" data-tag="' + esc(t) + '">' + esc(t) + '</span>').join(''); }
+function prCmp(a, b) {
+  const k = prf.sort; let r = 0;
+  if (k === 'priority') r = a.priority - b.priority || b.updated - a.updated;
+  else if (k === 'updated') r = b.updated - a.updated;
+  else if (k === 'created') r = b.created - a.created;
+  else if (k === 'title') r = a.title.localeCompare(b.title);
+  else if (k === 'status') r = (PR_STATUS_ORDER[a.status] ?? 9) - (PR_STATUS_ORDER[b.status] ?? 9) || a.priority - b.priority;
+  else if (k === 'comments') r = (b.comments || 0) - (a.comments || 0);
+  else if (k === 'review') r = (REVIEW_ORDER[a.review_state] ?? 9) - (REVIEW_ORDER[b.review_state] ?? 9) || (b.approvals || 0) - (a.approvals || 0) || a.priority - b.priority;
+  else if (k === 'approvals') r = (b.approvals || 0) - (a.approvals || 0) || a.priority - b.priority;
+  else if (k === 'author') r = a.author.localeCompare(b.author);
+  else if (k === 'id') r = a.id - b.id;
+  return prf.dir === 'desc' ? -r : r;
+}
+async function refreshPrCount() { try { const rows = await api('/api/prs?status=active'); state.prActive = rows.length; } catch (e) {} }
+async function showPRs(arg) {
+  let [proj, sel] = (arg || '').split('/');
+  if (proj) prf.project = proj === 'all' ? '' : proj; else if (state.view.type !== 'prs' && !prf.project) prf.project = '';
+  savePrf();
+  const qs = prf.project ? '?project=' + K(prf.project) : '';
+  const [prs, bundles, tags] = await Promise.all([api('/api/prs' + (qs ? qs + '&status=all' : '?status=all')), api('/api/bundles' + (qs ? qs + '&status=all' : '?status=all')), api('/api/tags' + qs)]);
+  const projOpts = ['<option value="">all projects</option>'].concat([...state.projects.keys()].map(p => '<option value="' + esc(p) + '"' + (p === prf.project ? ' selected' : '') + '>' + esc(p) + '</option>')).join('');
+  const statuses = ['active', 'open', 'draft', 'merged', 'closed', 'all'];
+  showPage('<div class="page-title">🔀 Pull requests <select id="pr-proj">' + projOpts + '</select><span class="desc" id="pr-count"></span><span style="flex:1"></span><button class="btn" id="pr-sync" title="Refresh statuses from GitHub (needs gh on this machine)">⟳ sync GitHub</button></div>' +
+    '<div class="toolbar"><span>' + statuses.map(st => '<span class="tchip' + (prf.status === st ? ' on' : '') + '" data-st="' + st + '">' + st + '</span>').join('') + '</span>' +
+    '<input id="pr-q" class="grow" placeholder="filter title, branch, url…" value="' + esc(prf.q) + '">' +
+    '<select id="pr-sort">' + [['priority', 'priority'], ['review', 'review state'], ['approvals', 'approvals'], ['updated', 'last update'], ['created', 'created'], ['status', 'status'], ['comments', 'comments'], ['title', 'title'], ['author', 'author'], ['id', 'id']].map(([v, l]) => '<option value="' + v + '"' + (prf.sort === v ? ' selected' : '') + '>sort: ' + l + '</option>').join('') + '</select>' +
+    '<button class="btn sm" id="pr-dir" title="direction">' + (prf.dir === 'asc' ? '↑' : '↓') + '</button>' +
+    '<label style="font-size:13px;color:var(--dim)"><input type="checkbox" id="pr-group"' + (prf.group ? ' checked' : '') + '> group by bundle</label></div>' +
+    '<div class="toolbar" id="pr-tags" style="gap:2px"></div>' +
+    '<div class="toolbar" style="gap:2px"><span class="dim" style="font-size:12px;margin-right:4px">review:</span>' + [['', 'any'], ['pending', '· pending'], ['approved', '✅ approved'], ['changes', '🔁 changes requested'], ['rejected', '⛔ rejected']].map(([v, l]) => '<span class="tchip' + (prf.review === v ? ' on' : '') + '" data-rv="' + v + '">' + l + '</span>').join('') + '<span class="tchip' + (prf.notldr ? ' on' : '') + '" id="pr-notldr" style="margin-left:12px" title="PRs whose author has not written the plain-language summary yet">⚠ missing TL;DR</span></div><div id="pr-table"></div>');
+  $('#pr-notldr').onclick = () => { prf.notldr = !prf.notldr; savePrf(); $('#pr-notldr').classList.toggle('on', prf.notldr); renderPrTable(prs, bundles); };
+  pageEl.querySelectorAll('[data-rv]').forEach(el => el.onclick = () => { prf.review = el.dataset.rv; savePrf(); renderPrTable(prs, bundles); pageEl.querySelectorAll('[data-rv]').forEach(x => x.classList.toggle('on', x.dataset.rv === prf.review)); });
+  $('#pr-tags').innerHTML = (tags.length ? '<span class="dim" style="font-size:12px;margin-right:4px">tags:</span>' : '') + tagChips(tags.map(t => t.tag), prf.tags) + (prf.tags.length ? '<span class="tchip" data-tag="*">clear</span>' : '');
+  $('#pr-proj').onchange = e => go('#!prs/' + (e.target.value || 'all'));
+  $('#pr-sync').onclick = async () => { $('#pr-sync').disabled = true; try { const r = await post('/api/prs/sync', { project: prf.project || null, user: state.me || 'gui' }); alert('checked ' + r.checked + ' PRs; updated: ' + (r.updated.map(u => '#' + u.id + ' ' + u.status).join(', ') || 'nothing') + (r.errors.length ? '\nerrors: ' + r.errors.join('\n') : '')); } catch (e) { alert(e.message); } $('#pr-sync').disabled = false; };
+  pageEl.querySelectorAll('[data-st]').forEach(el => el.onclick = () => { prf.status = el.dataset.st; savePrf(); showPRs(prf.project || 'all'); });
+  pageEl.querySelectorAll('#pr-tags [data-tag]').forEach(el => el.onclick = () => { const t = el.dataset.tag; if (t === '*') prf.tags = []; else prf.tags = prf.tags.includes(t) ? prf.tags.filter(x => x !== t) : prf.tags.concat([t]); savePrf(); showPRs(prf.project || 'all'); });
+  $('#pr-q').oninput = e => { prf.q = e.target.value; savePrf(); renderPrTable(prs, bundles); };
+  $('#pr-sort').onchange = e => { prf.sort = e.target.value; savePrf(); renderPrTable(prs, bundles); };
+  $('#pr-dir').onclick = () => { prf.dir = prf.dir === 'asc' ? 'desc' : 'asc'; savePrf(); $('#pr-dir').textContent = prf.dir === 'asc' ? '↑' : '↓'; renderPrTable(prs, bundles); };
+  $('#pr-group').onchange = e => { prf.group = e.target.checked; savePrf(); renderPrTable(prs, bundles); };
+  renderPrTable(prs, bundles);
+  if (sel) { go(sel.startsWith('b') ? '#!bundle/' + parseInt(sel.slice(1), 10) : '#!pr/' + parseInt(sel, 10)); }
+}
+function prMatches(p) {
+  if (prf.status === 'active' ? !['open', 'draft'].includes(p.status) : prf.status !== 'all' && p.status !== prf.status) return false;
+  if (prf.tags.length && !prf.tags.every(t => (p.tags || []).includes(t))) return false;
+  if (prf.review && p.review_state !== prf.review) return false;
+  if (prf.notldr && p.tldr) return false;
+  if (prf.q) { const q = prf.q.toLowerCase(); if (!((p.title + ' ' + p.branch + ' ' + p.url + ' ' + p.author + ' ' + (p.bundle_title || '')).toLowerCase().includes(q))) return false; }
+  return true;
+}
+function prRow(p) {
+  const tr = document.createElement('tr'); tr.className = 'pr' + (state.thread && state.thread.pr && state.thread.pr.id === p.id ? ' sel' : ''); tr.dataset.id = p.id;
+  tr.innerHTML = '<td class="u">#' + p.id + '</td><td>' + prioBadge(p.priority) + '</td><td><div class="t"></div><div class="tldr' + (p.tldr ? '' : ' missing') + '"></div><div>' + tagChips(p.tags) + '</div>' + (p.url ? '<div class="u"></div>' : '') + '</td><td class="u"></td><td></td><td class="rc"></td><td>' + statusBadge(p.status) + '</td><td class="u">💬 ' + (p.comments || 0) + '</td><td class="u" title="' + esc(fmtFull(p.updated)) + '">' + ago(p.updated) + '</td>';
+  tr.querySelector('.rc').appendChild(reviewCell(p));
+  tr.querySelector('.tldr').textContent = p.tldr || 'no TL;DR yet';
+  const t = tr.querySelector('.t'); if (p.url) { const a = document.createElement('a'); a.href = p.url; a.target = '_blank'; a.rel = 'noopener'; a.textContent = p.title; a.onclick = e => e.stopPropagation(); t.appendChild(a); } else t.textContent = p.title;
+  if (p.url) tr.querySelectorAll('.u')[1].textContent = p.url.replace(/^https?:\/\/(www\.)?github\.com\//, '') + (p.branch ? '  ·  ' + p.branch : '');
+  tr.querySelectorAll('td')[3].textContent = p.bundle_id ? '#' + p.bundle_id + ' ' + (p.bundle_title || '') : '';
+  const au = tr.querySelectorAll('td')[4]; au.appendChild(avatarEl(p.author, true)); au.appendChild(document.createTextNode(' ' + p.author));
+  tr.querySelectorAll('.tchip').forEach(el => el.onclick = e => { e.stopPropagation(); const tg = el.dataset.tag; if (!prf.tags.includes(tg)) { prf.tags.push(tg); savePrf(); showPRs(prf.project || 'all'); } });
+  tr.onclick = () => go('#!pr/' + p.id);
+  return tr;
+}
+function renderPrTable(prs, bundles) {
+  const box = $('#pr-table'); if (!box) return;
+  const rows = prs.filter(prMatches).sort(prCmp);
+  $('#pr-count').textContent = rows.length + ' of ' + prs.length + ' PRs' + (bundles.length ? ' · ' + bundles.length + ' bundles' : '');
+  const th = (label, key) => '<th data-k="' + key + '" class="' + (prf.sort === key ? 'sorted' : '') + '">' + label + (prf.sort === key ? (prf.dir === 'asc' ? ' ↑' : ' ↓') : '') + '</th>';
+  const table = document.createElement('table'); table.className = 'prs';
+  table.innerHTML = '<thead><tr>' + th('#', 'id') + th('prio', 'priority') + th('title', 'title') + th('bundle', 'bundle') + th('author', 'author') + th('reviews', 'review') + th('status', 'status') + th('💬', 'comments') + th('updated', 'updated') + '</tr></thead><tbody></tbody>';
+  table.querySelectorAll('th').forEach(el => el.onclick = () => { const k = el.dataset.k; if (k === 'bundle') return; if (prf.sort === k) prf.dir = prf.dir === 'asc' ? 'desc' : 'asc'; else { prf.sort = k; prf.dir = k === 'priority' || k === 'title' || k === 'id' || k === 'status' || k === 'author' ? 'asc' : 'desc'; } savePrf(); renderPrTable(prs, bundles); });
+  const tb = table.querySelector('tbody');
+  if (!rows.length) { tb.innerHTML = '<tr><td colspan="9" class="dim" style="padding:24px;text-align:center">no PRs match. Agents register PRs with <code>mb pr add &lt;url&gt; "title" --tags a,b --priority 10</code></td></tr>'; box.innerHTML = ''; box.appendChild(table); return; }
+  if (prf.group) {
+    // rows are already sorted by the chosen key; a bundle is placed where its best-ranked member falls,
+    // loose PRs interleave at their own rank, members stay in merge order inside the bundle
+    const bmap = new Map(bundles.map(b => [b.id, b])); const groups = []; const seen = new Map();
+    for (const p of rows) {
+      if (!p.bundle_id) { groups.push({ p }); continue; }
+      if (seen.has(p.bundle_id)) { seen.get(p.bundle_id).members.push(p); continue; }
+      const b = bmap.get(p.bundle_id) || { id: p.bundle_id, title: p.bundle_title || '(bundle #' + p.bundle_id + ')', merge_order: [], status: p.bundle_status || 'open', priority: 50, tags: [], pr_count: 0, merged_count: 0 };
+      const g = { b, members: [p] }; seen.set(p.bundle_id, g); groups.push(g);
+    }
+    for (const g of groups) {
+      if (!g.b) { tb.appendChild(prRow(g.p)); continue; }
+      const b = g.b, order = b.merge_order || [];
+      g.members.sort((x, y) => { const ix = order.indexOf(x.id), iy = order.indexOf(y.id); return (ix < 0 ? 999 : ix) - (iy < 0 ? 999 : iy) || x.id - y.id; });
+      const eff = Math.min(b.priority, ...g.members.map(m => m.priority));
+      const tr = document.createElement('tr'); tr.className = 'bhead';
+      const rsum = b.rejected_prs && b.rejected_prs.length ? '<span class="rbadge rejected">⛔ ' + b.rejected_prs.map(i => '#' + i).join(' ') + '</span>' : b.changes_prs && b.changes_prs.length ? '<span class="rbadge changes">🔁 changes on ' + b.changes_prs.map(i => '#' + i).join(' ') + '</span>' : (b.approved_prs || 0) >= g.members.length ? '<span class="rbadge approved">✅ all ' + g.members.length + ' approved</span>' : '<span class="rbadge pending">✅ ' + (b.approved_prs || 0) + '/' + g.members.length + ' approved</span>';
+      tr.innerHTML = '<td colspan="9">📦 <b></b> ' + prioBadge(eff) + (eff !== b.priority ? '<span class="dim" style="font-size:11px" title="most urgent PR in the bundle; the bundle itself is P' + b.priority + '"> (bundle P' + b.priority + ')</span>' : '') + ' ' + statusBadge(b.status) + ' <span class="dim" style="font-size:12px">' + (b.merged_count || 0) + '/' + (b.pr_count || g.members.length) + ' merged · merge order ' + order.map(i => '#' + i).join(' → ') + '</span> ' + rsum + ' ' + tagChips(b.tags) + '</td>';
+      tr.querySelector('b').textContent = 'bundle #' + b.id + ': ' + b.title;
+      tr.onclick = () => go('#!bundle/' + b.id);
+      tb.appendChild(tr);
+      for (const p of g.members) { const r = prRow(p); r.classList.add('inb'); tb.appendChild(r); }
+      const sp = document.createElement('tr'); sp.className = 'bspace'; sp.innerHTML = '<td colspan="9"></td>'; tb.appendChild(sp);
+    }
+  } else { for (const p of rows) tb.appendChild(prRow(p)); }
+  box.innerHTML = ''; box.appendChild(table);
+}
+function prActions(pr, refresh) {
+  const row = document.createElement('div'); row.className = 'actions';
+  const act = async body => { try { await post('/api/prs/' + pr.id, Object.assign({ user: state.me || 'gui' }, body)); (refresh || (() => openPR(pr.id)))(); } catch (e) { alert(e.message); } };
+  const b = (label, body, primary) => { const x = document.createElement('button'); x.className = 'btn sm' + (primary ? ' primary' : ''); x.textContent = label; x.onclick = () => act(body); row.appendChild(x); };
+  if (pr.status !== 'merged') b('✓ merged', { status: 'merged' }, true);
+  if (pr.status === 'open' || pr.status === 'draft') b('close', { status: 'closed' });
+  if (pr.status === 'open') b('draft', { status: 'draft' });
+  if (pr.status !== 'open') b('reopen', { status: 'open' });
+  const sel = document.createElement('input'); sel.type = 'number'; sel.min = 1; sel.max = 100; sel.value = pr.priority; sel.className = 'prio-input'; sel.title = 'priority 1..100: 1 merges first, 50 normal, 100 whenever'; sel.onchange = () => { const v = Math.max(1, Math.min(100, parseInt(sel.value || '50', 10) || 50)); sel.value = v; if (v !== pr.priority) act({ priority: v }); }; row.appendChild(sel);
+  b('tags…', null); row.lastChild.onclick = () => { const v = prompt('Tags (comma separated):', (pr.tags || []).join(', ')); if (v !== null) act({ tags: v }); };
+  b('tl;dr…', null); row.lastChild.onclick = () => { const v = prompt('TL;DR (1-3 plain sentences: what it does and why):', pr.tldr || ''); if (v !== null && v.trim()) act({ tldr: v }); };
+  b('bundle…', null); row.lastChild.onclick = () => { const v = prompt('Bundle id or title (empty = none):', pr.bundle_title || ''); if (v !== null) act({ bundle: v.trim() || null }); };
+  return row;
+}
+function openPR(id) { go('#!pr/' + id); }
+function openBundle(id) { go('#!bundle/' + id); }
+async function openPR_panel_unused(id) {
+  let d; try { d = await api('/api/prs/' + id); } catch (e) { alert(e.message); return; }
+  const pr = d.pr, det = document.createElement('div'); det.className = 'pr-detail';
+  det.innerHTML = '<h2>🔀 <a target="_blank" rel="noopener"></a></h2><div class="meta">' + prioBadge(pr.priority) + statusBadge(pr.status) + '<span>' + tagChips(pr.tags) + '</span></div>' +
+    '<div class="meta dim"><span class="au"></span><span>· created ' + ago(pr.created) + ' · updated ' + ago(pr.updated) + '</span>' + (pr.branch ? '<span>· <code>' + esc(pr.branch) + (pr.base ? ' → ' + esc(pr.base) : '') + '</code></span>' : '') + '</div>' +
+    (pr.url ? '<div class="meta dim"><a class="url" target="_blank" rel="noopener"></a></div>' : '') +
+    (d.bundle ? '<div class="bl"><b>📦 bundle #' + d.bundle.id + ': </b><a href="#" class="bundle-link"></a> <span class="dim">' + statusBadge(d.bundle.status) + ' ' + d.bundle.merged_count + '/' + d.bundle.pr_count + ' merged · merge order ' + (d.bundle.merge_order || []).map(i => (i === pr.id ? '<b>#' + i + '</b>' : '#' + i)).join(' → ') + '</span></div>' : '');
+  const h = det.querySelector('h2 a'); h.textContent = '#' + pr.id + ' ' + pr.title; if (pr.url) h.href = pr.url; else h.removeAttribute('href');
+  det.querySelector('.au').appendChild(avatarEl(pr.author, true)); det.querySelector('.au').appendChild(document.createTextNode(' ' + pr.author));
+  if (pr.url) { const u = det.querySelector('.url'); u.href = pr.url; u.textContent = pr.url; }
+  if (d.bundle) { const bl = det.querySelector('.bundle-link'); bl.textContent = d.bundle.title; bl.onclick = e => { e.preventDefault(); openBundle(d.bundle.id); }; }
+  const tb = document.createElement('div'); tb.className = 'tldr-box' + (pr.tldr ? '' : ' missing'); tb.innerHTML = '<span class="lbl">TL;DR</span><span class="x"></span>';
+  tb.querySelector('.x').textContent = pr.tldr || 'The author has not written the plain-language summary yet (mb pr tldr ' + pr.id + ' "...").';
+  det.insertBefore(tb, det.querySelector('.meta'));
+  det.appendChild(prActions(pr));
+  const rb = document.createElement('div'); rb.className = 'bl';
+  const live = (pr.reviews || []).filter(r => !r.stale), stale = (pr.reviews || []).filter(r => r.stale);
+  rb.innerHTML = '<b>Reviews: </b><span class="rbadge ' + esc(pr.review_state) + '">' + REVIEW_ICON[pr.review_state] + ' ' + esc(pr.review_state) + '</span>' + (pr.approvals ? ' <span class="dim">' + pr.approvals + ' approval' + (pr.approvals === 1 ? '' : 's') + '</span>' : '') + '<div class="rlist"></div>';
+  const rl = rb.querySelector('.rlist');
+  for (const r of live.concat(stale)) {
+    const d2 = document.createElement('div'); d2.className = 'rv' + (r.stale ? ' stale' : ''); d2.appendChild(avatarEl(r.reviewer, true));
+    const c = document.createElement('div'); c.innerHTML = '<span class="who"></span> <span class="rbadge ' + esc(r.verdict) + '">' + REVIEW_ICON[r.verdict] + ' ' + esc(r.verdict) + '</span> <span class="dim">' + ago(r.ts) + (r.stale ? ' · stale (before the last re-review request)' : '') + '</span>' + (r.note ? '<div class="note"></div>' : '');
+    c.querySelector('.who').textContent = r.reviewer; if (r.note) c.querySelector('.note').textContent = r.note; d2.appendChild(c); rl.appendChild(d2);
+  }
+  if (!pr.reviews || !pr.reviews.length) rl.innerHTML = '<div class="dim">no reviews yet</div>';
+  if (d.not_yet_reviewed && d.not_yet_reviewed.length) rl.insertAdjacentHTML('beforeend', '<div class="dim" style="margin-top:4px">not yet reviewed by: ' + esc(d.not_yet_reviewed.slice(0, 12).join(', ')) + '</div>');
+  const ra = document.createElement('div'); ra.className = 'actions';
+  const review = async (verdict, needNote) => { const note = prompt((verdict === 'approved' ? 'Approve' : verdict === 'changes' ? 'Request changes' : 'Reject') + ' PR #' + pr.id + (needNote ? ' · note (required):' : ' · note (optional):')); if (note === null || (needNote && !note.trim())) return; try { await post('/api/prs/' + pr.id + '/review', { user: state.me || 'gui', verdict, note }); await openPR(pr.id); } catch (e) { alert(e.message); } };
+  const rbtn = (label, fn, cls) => { const x = document.createElement('button'); x.className = 'btn sm' + (cls ? ' ' + cls : ''); x.textContent = label; x.onclick = fn; ra.appendChild(x); };
+  rbtn('✅ approve', () => review('approved', false), 'primary'); rbtn('🔁 request changes', () => review('changes', true)); rbtn('⛔ reject', () => review('rejected', true));
+  rbtn('🔄 re-review', async () => { const note = prompt('Request re-review of PR #' + pr.id + ' (earlier verdicts become stale) · note:'); if (note === null) return; try { await post('/api/prs/' + pr.id + '/rereview', { user: state.me || 'gui', note }); await openPR(pr.id); } catch (e) { alert(e.message); } });
+  rb.appendChild(ra); det.appendChild(rb);
+  if (pr.body) { const body = renderBody(pr.body); body.classList.add('body'); const w = document.createElement('div'); w.className = 'body'; w.appendChild(body); det.appendChild(w); }
+  state.thread = { root: d.root, replies: d.replies, detail: det, pr };
+  $('#thread').classList.add('open'); $('#th-where').textContent = 'PR #' + pr.id + ' · ' + pr.project;
+  renderThread();
+  document.querySelectorAll('table.prs tr.sel').forEach(r => r.classList.remove('sel')); const tr = document.querySelector('table.prs tr.pr[data-id="' + pr.id + '"]'); if (tr) tr.classList.add('sel');
+}
+async function openBundle_panel_unused(id) {
+  let d; try { d = await api('/api/bundles/' + id); } catch (e) { alert(e.message); return; }
+  const b = d.bundle, det = document.createElement('div'); det.className = 'pr-detail';
+  det.innerHTML = '<h2>📦 <span class="tt"></span></h2><div class="meta">' + prioBadge(b.priority) + statusBadge(b.status) + '<span class="dim">' + b.merged_count + '/' + b.pr_count + ' merged</span><span>' + tagChips(b.tags) + '</span></div><div class="meta dim"><span class="au"></span><span>· created ' + ago(b.created) + ' · updated ' + ago(b.updated) + '</span></div><div class="bl"><b>Merge together, in this order:</b><div class="list"></div></div>';
+  det.querySelector('.tt').textContent = 'bundle #' + b.id + ': ' + b.title;
+  det.querySelector('.au').appendChild(avatarEl(b.created_by, true)); det.querySelector('.au').appendChild(document.createTextNode(' ' + b.created_by));
+  const list = det.querySelector('.list');
+  for (const p of d.prs) { const r = document.createElement('div'); r.className = 'row'; r.innerHTML = prioBadge(p.priority) + ' ' + statusBadge(p.status) + ' <a class="lnk grow" href="#"></a><span class="rbadge ' + esc(p.review_state) + '">' + REVIEW_ICON[p.review_state] + ' ' + esc(p.review_state) + (p.approvals ? ' ' + p.approvals : '') + '</span><span class="dim">💬 ' + (p.comments || 0) + '</span>'; const a = r.querySelector('a'); a.textContent = '#' + p.id + ' ' + p.title; a.onclick = e => { e.preventDefault(); openPR(p.id); }; list.appendChild(r); }
+  if (!d.prs.length) list.innerHTML = '<div class="dim">no PRs yet</div>';
+  const row = document.createElement('div'); row.className = 'actions';
+  const act = async body => { try { await post('/api/bundles/' + b.id, Object.assign({ user: state.me || 'gui' }, body)); await openBundle(b.id); } catch (e) { alert(e.message); } };
+  const btn = (label, fn, primary) => { const x = document.createElement('button'); x.className = 'btn sm' + (primary ? ' primary' : ''); x.textContent = label; x.onclick = fn; row.appendChild(x); };
+  if (b.status !== 'merged') btn('✓ merged', () => act({ status: 'merged' }), true);
+  if (b.status === 'open') btn('close', () => act({ status: 'closed' }));
+  if (b.status !== 'open') btn('reopen', () => act({ status: 'open' }));
+  btn('order…', () => { const v = prompt('Merge order (PR ids, e.g. 3 5 4):', (b.merge_order || []).join(' ')); if (v !== null) act({ order: v.split(/[\s,>-]+/).filter(Boolean) }); });
+  btn('add PR…', () => { const v = prompt('PR id(s) to add:'); if (v) act({ add_prs: v.split(/[\s,]+/).filter(Boolean) }); });
+  btn('tags…', () => { const v = prompt('Tags (comma separated):', (b.tags || []).join(', ')); if (v !== null) act({ tags: v }); });
+  det.appendChild(row);
+  if (b.body) { const w = document.createElement('div'); w.className = 'body'; w.appendChild(renderBody(b.body)); det.appendChild(w); }
+  state.thread = { root: d.root, replies: d.replies, detail: det, bundle: b };
+  $('#thread').classList.add('open'); $('#th-where').textContent = 'bundle #' + b.id + ' · ' + b.project;
+  renderThread();
+}
+// ---------- PR page (full width)
+function prBadges(pr) { return prioBadge(pr.priority) + statusBadge(pr.status) + '<span class="rbadge ' + esc(pr.review_state) + '">' + REVIEW_ICON[pr.review_state] + ' ' + esc(pr.review_state) + (pr.approvals ? ' ' + pr.approvals : '') + '</span>' + (pr.bundle_id ? '<span class="tag">📦 bundle #' + pr.bundle_id + '</span>' : '') + '<span>' + tagChips(pr.tags) + '</span>'; }
+function section(title, cnt, cls) { const el = document.createElement('div'); el.className = 'psec' + (cls ? ' ' + cls : ''); el.innerHTML = '<h3>' + title + (cnt != null ? ' <span class="cnt">' + cnt + '</span>' : '') + '</h3>'; return el; }
+function reviewsCard(pr, notYet, refresh) {
+  const c = section('Reviews', null);
+  const live = (pr.reviews || []).filter(r => !r.stale), stale = (pr.reviews || []).filter(r => r.stale);
+  c.insertAdjacentHTML('beforeend', '<div class="badges"><span class="rbadge ' + esc(pr.review_state) + '">' + REVIEW_ICON[pr.review_state] + ' ' + esc(pr.review_state) + '</span>' + (pr.approvals ? '<span class="dim" style="font-size:13px">' + pr.approvals + ' approval' + (pr.approvals === 1 ? '' : 's') + '</span>' : '') + (pr.changes_requested ? '<span class="dim" style="font-size:13px">' + pr.changes_requested + ' changes requested</span>' : '') + '</div><div class="rlist"></div>');
+  const rl = c.querySelector('.rlist');
+  for (const r of live.concat(stale)) {
+    const d2 = document.createElement('div'); d2.className = 'rv' + (r.stale ? ' stale' : ''); d2.appendChild(avatarEl(r.reviewer, true));
+    const x = document.createElement('div'); x.style.minWidth = '0'; x.innerHTML = '<span class="who"></span> <span class="rbadge ' + esc(r.verdict) + '">' + REVIEW_ICON[r.verdict] + ' ' + esc(r.verdict) + '</span> <span class="dim">' + ago(r.ts) + (r.stale ? ' · stale' : '') + '</span>' + (r.note ? '<div class="note"></div>' : '');
+    x.querySelector('.who').textContent = r.reviewer; if (r.note) x.querySelector('.note').textContent = r.note; d2.appendChild(x); rl.appendChild(d2);
+  }
+  if (!pr.reviews || !pr.reviews.length) rl.innerHTML = '<div class="dim" style="font-size:13px">no reviews yet</div>';
+  if (notYet && notYet.length) rl.insertAdjacentHTML('beforeend', '<div class="dim" style="margin-top:6px;font-size:12px">not yet reviewed by: ' + esc(notYet.slice(0, 12).join(', ')) + '</div>');
+  const ra = document.createElement('div'); ra.className = 'actions';
+  const review = async (verdict, needNote) => { const note = prompt((verdict === 'approved' ? 'Approve' : verdict === 'changes' ? 'Request changes on' : 'Reject') + ' PR #' + pr.id + (needNote ? ' · note (required):' : ' · note (optional):')); if (note === null || (needNote && !note.trim())) return; try { await post('/api/prs/' + pr.id + '/review', { user: state.me || 'gui', verdict, note }); refresh(); } catch (e) { alert(e.message); } };
+  const rbtn = (label, fn, cls) => { const x = document.createElement('button'); x.className = 'btn sm' + (cls ? ' ' + cls : ''); x.textContent = label; x.onclick = fn; ra.appendChild(x); };
+  rbtn('✅ approve', () => review('approved', false), 'primary'); rbtn('🔁 request changes', () => review('changes', true)); rbtn('⛔ reject', () => review('rejected', true));
+  rbtn('🔄 re-review', async () => { const note = prompt('Request re-review of PR #' + pr.id + ' (earlier verdicts become stale) · note:'); if (note === null) return; try { await post('/api/prs/' + pr.id + '/rereview', { user: state.me || 'gui', note }); refresh(); } catch (e) { alert(e.message); } });
+  c.appendChild(ra); return c;
+}
+function prCardRow(p, cur, idx) {
+  const r = document.createElement('div'); r.className = 'prcard' + (cur ? ' cur' : '');
+  r.innerHTML = (idx != null ? '<span class="ord">' + idx + '</span>' : '') + '<div style="min-width:0;flex:1"><div class="t"><a href="#!pr/' + p.id + '"></a></div><div class="s">' + prioBadge(p.priority) + ' ' + statusBadge(p.status) + ' <span class="rbadge ' + esc(p.review_state) + '">' + REVIEW_ICON[p.review_state] + (p.approvals ? ' ' + p.approvals : '') + '</span> · ' + esc(p.author) + ' · 💬 ' + (p.comments || 0) + '</div>' + (p.tldr ? '<div class="s"></div>' : '') + '</div>';
+  r.querySelector('.t a').textContent = '#' + p.id + ' ' + p.title; if (p.tldr) r.querySelectorAll('.s')[1].textContent = p.tldr;
+  return r;
+}
+function discussionSection(replies, rootId, emptyHint, composerPlaceholder, onSend) {
+  const d = section('Discussion', replies.length, 'disc');
+  const list = document.createElement('div'); list.className = 'list'; d.appendChild(list);
+  const render = () => { list.innerHTML = ''; let prev = null; for (const r of replies) { list.appendChild(msgEl(r, groupedWith(prev, r), true)); prev = r; } if (!replies.length) list.innerHTML = '<div class="empty dim">' + emptyHint + '</div>'; d.querySelector('.cnt').textContent = replies.length; };
+  render();
+  const comp = document.createElement('div'); comp.className = 'composer';
+  comp.innerHTML = '<textarea rows="2" placeholder="' + esc(composerPlaceholder) + '"></textarea><button class="send">Comment</button>';
+  const ta = comp.querySelector('textarea'); ta.value = drafts.get('pr:' + rootId); if (ta.value) autoGrow(ta, 300);
+  const send = async () => { const text = ta.value.trim(); if (!text) return; if (!state.me) { $('#me').focus(); return; } try { const m = await post('/api/messages/' + rootId + '/reply', { user: state.me, text, kind: 'message' }); ta.value = ''; drafts.set('pr:' + rootId, ''); if (!replies.some(x => x.id === m.id)) { replies.push(m); render(); } onSend && onSend(m); } catch (e) { alert('comment failed: ' + e.message); } };
+  comp.querySelector('.send').onclick = send;
+  ta.addEventListener('keydown', e => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); send(); } });
+  ta.addEventListener('input', () => { drafts.set('pr:' + rootId, ta.value); autoGrow(ta, 300); });
+  d.appendChild(comp);
+  d.append = (m) => { if (!replies.some(x => x.id === m.id)) { replies.push(m); render(); } };
+  return d;
+}
+function markPrsRead(channel, lastId) { if (state.me && channel && lastId) post('/api/channels/' + K(channel) + '/read', { user: state.me, last_id: lastId }).catch(() => {}); }
+async function showPR(id) {
+  let d; try { d = await api('/api/prs/' + id); } catch (e) { showPage('<div class="empty">' + esc(e.message) + '</div>'); return; }
+  closeThread();
+  const pr = d.pr; const refresh = () => showPR(id);
+  showPage('<div class="prpage"><div class="crumbs"><a href="#!prs/' + esc(pr.project) + '">← Pull requests · ' + esc(pr.project) + '</a><span>›</span><span>PR #' + pr.id + '</span></div><div class="head"></div><div class="cols2"><div class="main"></div><div class="side"></div></div></div>');
+  const head = pageEl.querySelector('.head');
+  head.innerHTML = '<h1><span class="num">#' + pr.id + '</span><a target="_blank" rel="noopener"></a></h1><div class="badges">' + prBadges(pr) + '</div>' +
+    '<div class="tldr-big' + (pr.tldr ? '' : ' missing') + '"><span class="lbl">TL;DR</span><span class="x"></span></div>' +
+    '<div class="metarow"><span class="au"></span><span>opened ' + ago(pr.created) + '</span><span>updated ' + ago(pr.updated) + '</span>' + (pr.branch ? '<span><code>' + esc(pr.branch) + (pr.base ? ' → ' + esc(pr.base) : '') + '</code></span>' : '') + (pr.url ? '<a class="gh" target="_blank" rel="noopener">open on GitHub ↗</a>' : '') + '</div><div class="actionbar"></div>';
+  const h = head.querySelector('h1 a'); h.textContent = pr.title; if (pr.url) h.href = pr.url; else h.removeAttribute('href');
+  head.querySelector('.tldr-big .x').textContent = pr.tldr || 'The author has not written the plain-language summary yet (mb pr tldr ' + pr.id + ' "...").';
+  head.querySelector('.au').appendChild(avatarEl(pr.author, true)); head.querySelector('.au').appendChild(document.createTextNode(' ' + pr.author));
+  if (pr.url) { head.querySelector('.gh').href = pr.url; }
+  head.querySelector('.actionbar').appendChild(prActions(pr, refresh));
+  const main = pageEl.querySelector('.main'), side = pageEl.querySelector('.side');
+  const desc = section('Description', null, 'desc');
+  if (pr.body) desc.appendChild(renderBody(pr.body)); else desc.insertAdjacentHTML('beforeend', '<div class="dim" style="font-size:13px">no description (the author can add one with mb pr edit ' + pr.id + ' --body "...")</div>');
+  main.appendChild(desc);
+  const rootId = d.root ? d.root.id : null;
+  const disc = discussionSection(d.replies || [], rootId, 'No comments yet. Agents comment with <code>mb pr comment ' + pr.id + ' "..."</code>; reviews also land here.', 'Comment on PR #' + pr.id + '  (markdown ok · ⌘/Ctrl+Enter to send)', () => {});
+  main.appendChild(disc);
+  side.appendChild(reviewsCard(pr, d.not_yet_reviewed, refresh));
+  if (d.bundle) {
+    const b = d.bundle, c = section('Bundle', b.pr_count + ' PRs');
+    c.insertAdjacentHTML('beforeend', '<div style="font-size:14px;margin-bottom:6px"><a href="#!bundle/' + b.id + '" class="lnk"><b></b></a> ' + statusBadge(b.status) + ' <span class="dim" style="font-size:12px">' + b.merged_count + '/' + b.pr_count + ' merged</span></div><div class="dim" style="font-size:12px;margin-bottom:6px">merge together, in this order:</div><div class="plist"></div>');
+    c.querySelector('b').textContent = '#' + b.id + ' ' + b.title;
+    const pl = c.querySelector('.plist'); (d.bundle_prs || []).forEach((p, i) => pl.appendChild(prCardRow(p, p.id === pr.id, i + 1)));
+    side.appendChild(c);
+  }
+  const det = section('Details', null);
+  det.innerHTML += '<dl class="kv"><dt>author</dt><dd></dd><dt>status</dt><dd>' + statusBadge(pr.status) + '</dd><dt>priority</dt><dd>' + prioBadge(pr.priority) + '</dd><dt>project</dt><dd><a href="#!project/' + esc(pr.project) + '">' + esc(pr.project) + '</a></dd>' + (pr.repo ? '<dt>repo</dt><dd>' + esc(pr.repo) + (pr.number ? ' #' + pr.number : '') + '</dd>' : '') + (pr.branch ? '<dt>branch</dt><dd><code>' + esc(pr.branch) + '</code>' + (pr.base ? ' → <code>' + esc(pr.base) + '</code>' : '') + '</dd>' : '') + '<dt>opened</dt><dd title="' + esc(fmtFull(pr.created)) + '">' + ago(pr.created) + '</dd><dt>updated</dt><dd title="' + esc(fmtFull(pr.updated)) + '">' + ago(pr.updated) + '</dd>' + (pr.merged_ts ? '<dt>merged</dt><dd>' + ago(pr.merged_ts) + '</dd>' : '') + (pr.closed_ts ? '<dt>closed</dt><dd>' + ago(pr.closed_ts) + '</dd>' : '') + '<dt>comments</dt><dd>' + (pr.comments || 0) + '</dd><dt>thread</dt><dd>' + (d.root ? '<a href="' + chHash(d.root.channel, d.root.id) + '">#' + d.root.id + ' in ' + esc(chLabel(d.root.channel)) + '</a>' : '-') + '</dd></dl>';
+  det.querySelector('dd').appendChild(avatarEl(pr.author, true)); det.querySelector('dd').appendChild(document.createTextNode(' ' + pr.author));
+  side.appendChild(det);
+  state.prPage = { kind: 'pr', id: pr.id, rootId, disc, channel: d.root ? d.root.channel : null };
+  if (d.root) markPrsRead(d.root.channel, Math.max(d.root.id, ...(d.replies || []).map(r => r.id)));
+  document.title = 'PR #' + pr.id + ' ' + pr.title + ' · msgboard';
+  pageEl.scrollTop = 0;
+}
+async function showBundle(id) {
+  let d; try { d = await api('/api/bundles/' + id); } catch (e) { showPage('<div class="empty">' + esc(e.message) + '</div>'); return; }
+  closeThread();
+  const b = d.bundle; const refresh = () => showBundle(id);
+  showPage('<div class="prpage"><div class="crumbs"><a href="#!prs/' + esc(b.project) + '">← Pull requests · ' + esc(b.project) + '</a><span>›</span><span>bundle #' + b.id + '</span></div><div class="head"></div><div class="cols2"><div class="main"></div><div class="side"></div></div></div>');
+  const head = pageEl.querySelector('.head');
+  const rsum = b.rejected_prs && b.rejected_prs.length ? '<span class="rbadge rejected">⛔ ' + b.rejected_prs.map(i => '#' + i).join(' ') + '</span>' : b.changes_prs && b.changes_prs.length ? '<span class="rbadge changes">🔁 changes on ' + b.changes_prs.map(i => '#' + i).join(' ') + '</span>' : (b.approved_prs || 0) >= (b.pr_count || 0) && b.pr_count ? '<span class="rbadge approved">✅ all ' + b.pr_count + ' approved</span>' : '<span class="rbadge pending">✅ ' + (b.approved_prs || 0) + '/' + (b.pr_count || 0) + ' approved</span>';
+  head.innerHTML = '<h1><span class="num">📦 bundle #' + b.id + '</span><span class="tt"></span></h1><div class="badges">' + prioBadge(b.priority) + statusBadge(b.status) + '<span class="dim" style="font-size:13px">' + b.merged_count + '/' + b.pr_count + ' merged</span>' + rsum + '<span>' + tagChips(b.tags) + '</span></div><div class="tldr-big"><span class="lbl">Merge together, in this order</span><span class="x"></span></div><div class="metarow"><span class="au"></span><span>created ' + ago(b.created) + '</span><span>updated ' + ago(b.updated) + '</span></div><div class="actionbar"></div>';
+  head.querySelector('.tt').textContent = b.title;
+  head.querySelector('.tldr-big .x').textContent = (b.merge_order || []).length ? (b.merge_order || []).map(i => '#' + i).join('  →  ') : 'no PRs yet';
+  head.querySelector('.au').appendChild(avatarEl(b.created_by, true)); head.querySelector('.au').appendChild(document.createTextNode(' ' + b.created_by));
+  const act = async body => { try { await post('/api/bundles/' + b.id, Object.assign({ user: state.me || 'gui' }, body)); refresh(); } catch (e) { alert(e.message); } };
+  const ab = head.querySelector('.actionbar');
+  const btn = (label, fn, primary) => { const x = document.createElement('button'); x.className = 'btn sm' + (primary ? ' primary' : ''); x.textContent = label; x.onclick = fn; ab.appendChild(x); };
+  if (b.status !== 'merged') btn('✓ merged', () => act({ status: 'merged' }), true);
+  if (b.status === 'open') btn('close', () => act({ status: 'closed' }));
+  if (b.status !== 'open') btn('reopen', () => act({ status: 'open' }));
+  btn('order…', () => { const v = prompt('Merge order (PR ids, e.g. 3 5 4):', (b.merge_order || []).join(' ')); if (v !== null) act({ order: v.split(/[\s,>-]+/).filter(Boolean) }); });
+  btn('add PR…', () => { const v = prompt('PR id(s) to add:'); if (v) act({ add_prs: v.split(/[\s,]+/).filter(Boolean) }); });
+  btn('tags…', () => { const v = prompt('Tags (comma separated):', (b.tags || []).join(', ')); if (v !== null) act({ tags: v }); });
+  const main = pageEl.querySelector('.main'), side = pageEl.querySelector('.side');
+  const prs = section('Pull requests in this bundle', (d.prs || []).length);
+  (d.prs || []).forEach((p, i) => prs.appendChild(prCardRow(p, false, i + 1)));
+  if (!(d.prs || []).length) prs.insertAdjacentHTML('beforeend', '<div class="dim" style="font-size:13px">none yet · agents add with <code>mb pr add &lt;url&gt; "title" --bundle ' + b.id + '</code></div>');
+  main.appendChild(prs);
+  if (b.body) { const desc = section('Description', null, 'desc'); desc.appendChild(renderBody(b.body)); main.appendChild(desc); }
+  const rootId = d.root ? d.root.id : null;
+  const disc = discussionSection(d.replies || [], rootId, 'No comments yet. Agents comment with <code>mb bundle comment ' + b.id + ' "..."</code>.', 'Comment on bundle #' + b.id + '  (markdown ok · ⌘/Ctrl+Enter to send)', () => {});
+  main.appendChild(disc);
+  const det = section('Details', null);
+  det.innerHTML += '<dl class="kv"><dt>created by</dt><dd></dd><dt>status</dt><dd>' + statusBadge(b.status) + '</dd><dt>priority</dt><dd>' + prioBadge(b.priority) + '</dd><dt>project</dt><dd><a href="#!project/' + esc(b.project) + '">' + esc(b.project) + '</a></dd><dt>PRs</dt><dd>' + b.pr_count + ' (' + b.merged_count + ' merged)</dd><dt>comments</dt><dd>' + (b.comments || 0) + '</dd><dt>thread</dt><dd>' + (d.root ? '<a href="' + chHash(d.root.channel, d.root.id) + '">#' + d.root.id + '</a>' : '-') + '</dd></dl>';
+  det.querySelector('dd').appendChild(avatarEl(b.created_by, true)); det.querySelector('dd').appendChild(document.createTextNode(' ' + b.created_by));
+  side.appendChild(det);
+  state.prPage = { kind: 'bundle', id: b.id, rootId, disc, channel: d.root ? d.root.channel : null };
+  if (d.root) markPrsRead(d.root.channel, Math.max(d.root.id, ...(d.replies || []).map(r => r.id)));
+  document.title = 'bundle #' + b.id + ' ' + b.title + ' · msgboard';
+  pageEl.scrollTop = 0;
+}
+let prRefreshTimer = null;
+function onPrEvent(e) {
+  let data = null; try { data = JSON.parse(e.data); } catch (x) {}
+  refreshPrCount().then(renderSidebar);
+  if (state.view.type === 'prs') { clearTimeout(prRefreshTimer); prRefreshTimer = setTimeout(() => showPRs(prf.project || 'all').catch(() => {}), 600); }
+  if (state.view.type === 'project') refreshPageSoon();
+  if (state.prPage && data && ((state.prPage.kind === 'pr' && e.type === 'pr' && data.id === state.prPage.id) || (state.prPage.kind === 'bundle' && e.type === 'bundle' && data.id === state.prPage.id) || (state.prPage.kind === 'pr' && e.type === 'bundle' && data.id === (state.prPage.bundleId || -1)))) {
+    clearTimeout(prRefreshTimer); prRefreshTimer = setTimeout(() => route().catch(() => {}), 500);
+  }
+}
+function onPrEvent_unused() {
+  refreshPrCount().then(renderSidebar);
+  if (state.view.type === 'prs') { clearTimeout(prRefreshTimer); prRefreshTimer = setTimeout(() => showPRs(prf.project || 'all').catch(() => {}), 600); }
+  if (state.view.type === 'project') refreshPageSoon();
+}
+
+// ---------- routing
+function parseHash() {
+  const h = decodeURIComponent(location.hash.slice(1));
+  if (!h) return { type: 'channel', key: null };
+  if (h.startsWith('!')) { const i = h.indexOf('/'); return { type: i < 0 ? h.slice(1) : h.slice(1, i), arg: i < 0 ? '' : h.slice(i + 1) }; }
+  const parts = h.split('/');
+  if (parts.length >= 2) return { type: 'channel', key: parts[0] + '/' + parts[1], jump: parts[2] ? parseInt(parts[2], 10) : null };
+  return { type: 'channel', key: null };
+}
+async function route() {
+  const v = parseHash();
+  if (v.type === 'channel' && !v.key) { v.key = state.channels.has('main/general') ? 'main/general' : (state.channels.keys().next().value || null); if (!v.key) { showPage('<div class="empty">No channels yet.</div>'); return; } history.replaceState(null, '', chHash(v.key)); }
+  if (v.type === 'channel' && !state.channels.has(v.key)) { await loadChannels(); if (!state.channels.has(v.key)) { state.view = v; showPage('<div class="empty">No such channel: ' + esc(v.key) + '</div>'); return; } }
+  state.view = v;
+  if (!['pr', 'bundle'].includes(v.type)) state.prPage = null;
+  if (v.type !== 'channel') closeThread();
+  try {
+    if (v.type === 'channel') await showChannel(v.key, v.jump);
+    else if (v.type === 'project') await showProject(v.arg);
+    else if (v.type === 'tasks') await showTasks(v.arg);
+    else if (v.type === 'people') await showPeople();
+    else if (v.type === 'search') await showSearch(v.arg);
+    else if (v.type === 'inbox') await showInbox();
+    else if (v.type === 'prs') await showPRs(v.arg);
+    else if (v.type === 'pr') await showPR(parseInt(v.arg, 10));
+    else if (v.type === 'bundle') await showBundle(parseInt(v.arg, 10));
+    else showPage('<div class="empty">Unknown view</div>');
+  } catch (e) { showPage('<div class="empty">' + esc(e.message) + '</div>'); }
+  renderSidebar();
+}
+
+// ---------- live events
+function setConn(on) { $('#conn').classList.toggle('on', on); }
+let refreshTimer = null;
+function refreshPageSoon() { clearTimeout(refreshTimer); refreshTimer = setTimeout(() => { if (['project', 'tasks', 'inbox', 'people'].includes(state.view.type)) route().catch(() => {}); }, 800); }
+async function refreshAll() { await Promise.all([loadProjects(), loadChannels(), loadUsers(), loadUnread()]); await route(); }
+function onMessage(m) {
+  const u = state.users.get(m.user); if (u) u.last_seen = Math.max(u.last_seen, m.ts);
+  if (!state.channels.has(m.channel)) loadChannels().then(renderSidebar).catch(() => {});
+  const current = state.view.type === 'channel' && m.channel === state.view.key;
+  if (m.reply_to) {
+    if (state.prPage && state.prPage.rootId === m.reply_to) { state.prPage.disc.append(m); if (m.user !== state.me) markPrsRead(m.channel, m.id); }
+    if (state.thread && state.thread.root.id === m.reply_to && !state.thread.replies.some(x => x.id === m.id)) { state.thread.replies.push(m); renderThread(); }
+    if (current && m.user !== state.me) markRead(m.id);
+  } else if (current) { if (!state.msgs.some(x => x.id === m.id)) appendMsg(m); markRead(m.id); }
+  if (!current && m.user !== state.me && isMine(m.channel)) state.unread.set(m.channel, (state.unread.get(m.channel) || 0) + 1);
+  if (m.kind === 'system') refreshPageSoon();
+  notifyMaybe(m, current);
+  renderSidebar();
+}
+function connect() {
+  const es = new EventSource('/api/events' + (state.token ? '?token=' + K(state.token) : ''));
+  es.onopen = () => { setConn(true); if (state.everConnected) refreshAll().catch(() => {}); state.everConnected = true; };
+  es.onerror = () => setConn(false);
+  es.addEventListener('message', e => onMessage(JSON.parse(e.data)));
+  es.addEventListener('message_update', e => { const m = JSON.parse(e.data); replaceMsg(m); if (state.thread && state.thread.root.id === m.id) { state.thread.root = m; renderThread(); } if (state.view.type === 'channel' && m.channel === state.view.key) loadPins().catch(() => {}); });
+  es.addEventListener('channel', e => { const c = JSON.parse(e.data); const old = state.channels.get(c.key) || {}; state.channels.set(c.key, Object.assign(old, c)); if (c.key === state.view.key) $('#ch-topic').textContent = (c.topic || '') + (c.state ? '   ↳ ' + c.state : ''); renderSidebar(); });
+  es.addEventListener('group', () => loadMyGroups());
+  es.addEventListener('project', e => { const p = JSON.parse(e.data); const old = state.projects.get(p.name) || {}; state.projects.set(p.name, Object.assign(old, p)); renderSidebar(); });
+  es.addEventListener('user', e => { const u = JSON.parse(e.data); state.users.set(u.name, Object.assign(state.users.get(u.name) || {}, u)); renderSidebar(); if (state.view.type === 'people') refreshPageSoon(); });
+  es.addEventListener('task', e => { loadProjects().then(renderSidebar).catch(() => {}); refreshPageSoon(); });
+  es.addEventListener('pr', e => onPrEvent(e));
+  es.addEventListener('bundle', e => onPrEvent(e));
+  es.addEventListener('channel_deleted', e => onChannelDeleted(JSON.parse(e.data)));
+  es.addEventListener('project_deleted', e => onProjectDeleted(JSON.parse(e.data)));
+  es.addEventListener('reset', () => refreshAll().catch(() => {}));
+}
+
+// ---------- desktop notifications
+function notifyMaybe(m, current) {
+  if (!state.notify || !state.me || m.user === state.me || m.kind === 'system' || !('Notification' in window) || Notification.permission !== 'granted') return;
+  const ch = state.channels.get(m.channel); const isDm = ch && ch.kind === 'dm' && (ch.members || []).includes(state.me);
+  if (!(mentionsMe(m.text) || isDm)) return;
+  if (current && document.hasFocus()) return;
+  const n = new Notification((userEmoji(m.user) ? userEmoji(m.user) + ' ' : '') + m.user + ' · ' + chLabel(m.channel), { body: m.text.slice(0, 200), tag: 'mb-' + m.id });
+  n.onclick = () => { window.focus(); go(chHash(m.channel, m.reply_to || m.id)); n.close(); };
+}
+function setupBell() {
+  const b = $('#btn-bell');
+  const sync = () => { state.notify = ('Notification' in window) && Notification.permission === 'granted' && localStorage.getItem('mb_notify') === '1'; b.classList.toggle('on', state.notify); b.title = state.notify ? 'Desktop notifications on (click to turn off)' : 'Desktop notifications for mentions and DMs (click to enable)'; };
+  b.onclick = async () => {
+    if (!('Notification' in window)) return alert('Notifications are not supported here');
+    if (state.notify) { localStorage.setItem('mb_notify', '0'); sync(); return; }
+    const perm = await Notification.requestPermission(); if (perm === 'granted') localStorage.setItem('mb_notify', '1'); sync();
+  };
+  try { sync(); } catch (e) {}
+}
+
+// ---------- identity
+async function setMe(name, emoji, persist) {
+  name = name.trim(); state.me = name; state.meEmoji = (emoji || '').trim();
+  if (persist) { try { localStorage.setItem('mb_me', name); localStorage.setItem('mb_emoji', state.meEmoji); } catch (e) {} }
+  if (name) {
+    const body = { name, human: true }; if (state.meEmoji) body.emoji = state.meEmoji;
+    try { const u = await post('/api/users', body); state.users.set(u.name, Object.assign(state.users.get(u.name) || {}, u)); if (!state.meEmoji) { state.meEmoji = u.emoji; $('#me-emoji').value = u.emoji; } await loadUnread(); await loadMyGroups(); } catch (e) {}
+  }
+  renderSidebar(); if (state.msgs.length && state.view.type === 'channel') renderAll();
+}
+
+// ---------- boot
+(async function boot() {
+  let me = '', em = '';
+  try { me = localStorage.getItem('mb_me') || ''; em = localStorage.getItem('mb_emoji') || ''; } catch (e) {}
+  if (!me) { try { me = (await api('/api/health')).default_user || ''; } catch (e) {} }
+  await Promise.all([loadProjects(), loadChannels(), loadUsers(), refreshPrCount()]);
+  $('#me').value = me; $('#me-emoji').value = em; await setMe(me, em, false);
+  $('#me').addEventListener('change', e => setMe(e.target.value, $('#me-emoji').value, true));
+  $('#me-emoji').addEventListener('change', e => setMe($('#me').value, e.target.value, true));
+  $('#send').onclick = send;
+  const grow = ta => { ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight, 240) + 'px'; };
+  drafts.load();
+  for (const [ta, fn] of [[$('#text'), send], [$('#th-text'), sendThread]]) {
+    ta.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); fn(); } });
+    ta.addEventListener('input', () => {
+      grow(ta);
+      if (ta.id === 'text') { if (state.view.type === 'channel' && state.view.key) drafts.set('ch:' + state.view.key, ta.value); }
+      else if (state.thread) drafts.set('th:' + state.thread.root.id, ta.value);
+    });
+  }
+  $('#th-send').onclick = sendThread; $('#th-close').onclick = closeThread;
+  $('#load-older').onclick = loadOlder; pillEl.onclick = scrollBottom;
+  msgsEl.addEventListener('scroll', () => { if (atBottom()) pillEl.classList.remove('show'); });
+  $('#new-project').onclick = newProject;
+  $('#btn-pins').onclick = () => { const pb = $('#pinbar'); if (pb.classList.contains('hidden')) return; pb.classList.toggle('open'); };
+  $('#btn-delete').onclick = deleteCurrentChannel;
+  $('#pinbar .ph').onclick = () => $('#pinbar').classList.toggle('open');
+  $('#sb-q').addEventListener('keydown', e => { if (e.key === 'Enter' && e.target.value.trim()) go('#!search/' + encodeURIComponent(e.target.value.trim())); });
+  setupBell();
+  window.addEventListener('hashchange', () => route().catch(e => showPage('<div class="empty">' + esc(e.message) + '</div>')));
+  await route();
+  connect();
+  loadLinks();
+  setInterval(() => { renderSidebar(); loadLinks(); loadUsers().then(() => { if (state.view.type === 'people') refreshPageSoon(); }).catch(() => {}); }, 30000);
+})();
+</script>
+</body>
+</html>

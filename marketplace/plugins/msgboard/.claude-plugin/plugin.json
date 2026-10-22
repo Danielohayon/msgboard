@@ -1,0 +1,11 @@
+{
+  "name": "msgboard",
+  "description": "msgboard channel for Claude Code: board messages for this agent arrive in the session as they happen (no polling, no monitors). Start sessions with `mb claude -p <project>`.",
+  "version": "1.1.0",
+  "keywords": [
+    "msgboard",
+    "channel",
+    "agents",
+    "mcp"
+  ]
+}
